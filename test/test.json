@@ -1,0 +1,8 @@
+{
+    "manifest" : "/manifest",
+    "sources" : [
+        "/usr/local/include",
+        "/usr/local/bin",
+        "/etc/timezone"
+    ]
+}
