@@ -79,6 +79,7 @@ SOFTWARE.
 #include <varserver/varquery.h>
 #include <varserver/varfp.h>
 #include <openssl/evp.h>
+#include <sys/inotify.h>
 #include "ssl.h"
 
 /*==============================================================================
@@ -93,9 +94,22 @@ typedef struct _fileRef
     /*! calculated SHA256 */
     char sha[65];
 
+    /*! file watch id */
+    int id;
+
     /*! pointer to the next FileRef object */
     struct _fileRef *pNext;
 } FileRef;
+
+/*! change log entry */
+typedef struct _changeLogEntry
+{
+    /*! time of change */
+    time_t t;
+
+    /*! inotify watch id */
+    int id;
+} ChangeLogEntry;
 
 /*! Manifest state object */
 typedef struct _manifestState
@@ -105,6 +119,9 @@ typedef struct _manifestState
 
     /*! verbose flag */
     bool verbose;
+
+    /*! notify file descriptor */
+    int notifyfd;
 
     /*! name of the configuration file */
     char *pConfigFile;
@@ -127,6 +144,12 @@ typedef struct _manifestState
     /*! handle to the counter variable */
     VAR_HANDLE hCountVar;
 
+    /*! name of the change log variable */
+    char *changeLogName;
+
+    /*! handle to the change log render variable */
+    VAR_HANDLE hChangeLog;
+
     /*! list of FileRef objects which make up the manifest */
     FileRef *pManifest;
 
@@ -135,6 +158,21 @@ typedef struct _manifestState
 
     /*! flag to keep the manifest generator service running */
     bool running;
+
+    /*! maximum number of change log entries */
+    size_t maxEntries;
+
+    /*! number of entries in the circular buffer */
+    size_t nEntries;
+
+    /*! indicate start of the circular log */
+    size_t in;
+
+    /*! indicate end of the circular log */
+    size_t out;
+
+    /* pointer to the change log */
+    ChangeLogEntry *pChangeLog;
 
 } ManifestState;
 
@@ -195,6 +233,16 @@ VAR_HANDLE SetupVar( ManifestState *pState,
 static int RunManifestGenerator( ManifestState *pState );
 
 static int HandlePrintRequest( ManifestState *pState, int32_t id );
+
+static int HandleFileNotification( ManifestState *pState );
+
+static FileRef *FindFileRef( ManifestState *pState, int id );
+
+static int IncrementChangeCounter( ManifestState *pState );
+
+static int AddLogEntry( ManifestState *pState, int id );
+
+static int DumpChangeLog( ManifestState *pState, int fd );
 
 /*==============================================================================
         Private function definitions
@@ -284,6 +332,7 @@ static void usage( char *cmdname )
                 "usage: %s [-v] [-h] [-f config file] [-d config dir]\n"
                 " [-h] : display this help\n"
                 " [-v] : verbose output\n"
+                " [-n] : max log entries\n"
                 " [-f] : specify the manifest configuration file\n",
                 cmdname );
     }
@@ -317,7 +366,7 @@ static int ProcessOptions( int argC, char *argV[], ManifestState *pState )
 {
     int c;
     int result = EINVAL;
-    const char *options = "hvf:";
+    const char *options = "hvf:n:";
 
     if( ( pState != NULL ) &&
         ( argV != NULL ) )
@@ -332,6 +381,20 @@ static int ProcessOptions( int argC, char *argV[], ManifestState *pState )
 
                 case 'h':
                     usage( argV[0] );
+                    break;
+
+                case 'n':
+                    pState->maxEntries = strtoul( optarg, NULL, 10 );
+                    if ( pState->maxEntries > 0 )
+                    {
+                        pState->pChangeLog = calloc( pState->maxEntries,
+                                                     sizeof( ChangeLogEntry ) );
+                        if ( pState->pChangeLog == NULL )
+                        {
+                            printf("Cannot allocate change log\n");
+                            pState->maxEntries = 0;
+                        }
+                    }
                     break;
 
                 case 'f':
@@ -387,6 +450,9 @@ static int ProcessConfigFile( ManifestState *pState, char *filename )
     if ( ( pState != NULL ) &&
          ( pFileName != NULL ) )
     {
+        /* create a notification file descriptor */
+        pState->notifyfd = inotify_init1(IN_NONBLOCK);
+
         if ( pState->verbose == true )
         {
             printf("ProcessConfigFile: %s\n", pFileName );
@@ -401,6 +467,9 @@ static int ProcessConfigFile( ManifestState *pState, char *filename )
 
             /* get the name of the counter variable */
             pState->countVarName = JSON_GetStr( config, "countvar" );
+
+            /* get the name of the name of the change log variable */
+            pState->changeLogName = JSON_GetStr( config, "changelog" );
 
             /* get the manifest name */
             pState->name = JSON_GetStr(config, "manifest");
@@ -785,6 +854,11 @@ static int AddFile( ManifestState *pState, char *name )
             result = CalcManifest( pFileRef );
             if ( result == EOK )
             {
+                /* add an inotify watch on the file */
+                pFileRef->id = inotify_add_watch( pState->notifyfd,
+                                                  pFileRef->name,
+                                                 IN_CLOSE_WRITE );
+
                 /* add the manifest entry file reference to the manifest list */
                 pFileRef->pNext = pState->pManifest;
                 pState->pManifest = pFileRef;
@@ -1003,6 +1077,11 @@ static int SetupVars( ManifestState *pState )
            NOTIFY_PRINT,
            &(pState->hRenderVar) },
 
+        {  pState->changeLogName,
+           VARFLAG_VOLATILE,
+           NOTIFY_PRINT,
+           &(pState->hChangeLog) },
+
         { pState->countVarName,
           VARFLAG_VOLATILE,
           NOTIFY_NONE,
@@ -1147,10 +1226,20 @@ static int RunManifestGenerator( ManifestState *pState )
     int signum;
     int32_t sigval;
     VAR_HANDLE hVar;
+    fd_set readfds;
+    int n;
 
     if ( pState != NULL )
     {
         fd = VARSERVER_Signalfd();
+
+        /* calculate the */
+        n = fd;
+        if ( pState->notifyfd > n )
+        {
+            n = pState->notifyfd;
+        }
+        n++;
 
         /* assume everything is ok until it is not */
         result = EOK;
@@ -1158,11 +1247,27 @@ static int RunManifestGenerator( ManifestState *pState )
         pState->running = true;
         while ( pState->running == true )
         {
-            signum = VARSERVER_WaitSignalfd( fd, &sigval );
-            if ( signum == SIG_VAR_PRINT )
+            FD_ZERO( &readfds );
+            FD_SET( fd, &readfds );
+            FD_SET( pState->notifyfd, &readfds );
+
+            /* wait for activity on the file descriptors */
+            select( n, &readfds, NULL, NULL, 0 );
+            if ( FD_ISSET( fd, &readfds ) )
             {
-                /* handle a PRINT request */
-                result = HandlePrintRequest( pState, sigval );
+                /* get a variable server signal */
+                signum = VARSERVER_WaitSignalfd( fd, &sigval );
+                if ( signum == SIG_VAR_PRINT )
+                {
+                    /* handle a PRINT request */
+                    result = HandlePrintRequest( pState, sigval );
+                }
+            }
+
+            if ( FD_ISSET( pState->notifyfd, &readfds ) )
+            {
+                /* handle an inotify watch notification on a file */
+                result = HandleFileNotification( pState );
             }
         }
     }
@@ -1210,6 +1315,10 @@ static int HandlePrintRequest( ManifestState *pState, int32_t id )
             {
                 DumpManifest( pState, fd );
             }
+            else if ( hVar == pState->hChangeLog )
+            {
+                DumpChangeLog( pState, fd );
+            }
 
             /* Close the print session */
             result = VAR_ClosePrintSession( pState->hVarServer,
@@ -1217,6 +1326,350 @@ static int HandlePrintRequest( ManifestState *pState, int32_t id )
                                             fd );
         }
     }
+
+    return result;
+}
+
+/*============================================================================*/
+/*  HandleFileNotification                                                    */
+/*!
+    Handle a file notification from an inotify watchlist
+
+    The HandleFileNotification function reads file notification events
+    from the inotify file descriptor and processes each notification
+    received.
+
+    Some systems cannot read integer variables if they are not
+    properly aligned. On other systems, incorrect alignment may
+    decrease performance. Hence, the buffer used for reading from
+    the inotify file descriptor should have the same alignment as
+    struct inotify_event.
+
+    @param[in]
+        pState
+            pointer to the Manifest State
+
+    @retval EOK file notification handled successfully
+    @retval EINVAL invalid arguments
+
+==============================================================================*/
+static int HandleFileNotification( ManifestState *pState )
+{
+    int result = EINVAL;
+    char buf[4096]
+        __attribute__ ((aligned(__alignof__(struct inotify_event))));
+    const struct inotify_event *event;
+    ssize_t len;
+    bool done = false;
+    char *ptr;
+    FileRef *pFileRef;
+    VarObject obj;
+    char sha[65];
+
+    /* Loop while events can be read from inotify file descriptor. */
+    while( done == false )
+    {
+        /* Read some events. */
+        len = read( pState->notifyfd, buf, sizeof(buf) );
+        if ( len <= 0 )
+        {
+            done = true;
+        }
+        else
+        {
+            /* Loop over all events in the buffer. */
+            ptr = buf;
+
+            while ( ptr < ( buf + len ) )
+            {
+                /* get a pointer to an inotify_event to process */
+                event = (const struct inotify_event *) ptr;
+                if ( event->mask & IN_CLOSE_WRITE )
+                {
+                    /* find the appropriate file reference */
+                    pFileRef = FindFileRef( pState, event->wd );
+                    if ( pFileRef != NULL )
+                    {
+                        /* store the old SHA-256 */
+                        strcpy( sha, pFileRef->sha );
+
+                        /* update the manifest */
+                        result = CalcManifest( pFileRef );
+                        if ( result == EOK )
+                        {
+                            if ( strcmp( sha, pFileRef->sha ) != 0 )
+                            {
+                                /* Add log entry */
+                                AddLogEntry( pState, pFileRef->id );
+
+                                /* increment the change count */
+                                result = IncrementChangeCounter( pState );
+                            }
+                        }
+                    }
+                }
+
+                /* move to the next inotify event */
+                ptr += sizeof(struct inotify_event) + event->len;
+            }
+        }
+    }
+
+    return result;
+}
+
+/*============================================================================*/
+/*  IncrementChangeCounter                                                    */
+/*!
+    Increment the change counter by 1
+
+    The IncrementChangeCounter function increments the change counter
+    by 1 and updates the change counter variable if it is available.
+
+    @param[in]
+        pState
+            pointer to the Manifest State
+
+    @retval EOK the change counter was incremented
+    @retval ENOENT no change counter was found
+    @retval EINVAL invalid arguments
+
+==============================================================================*/
+static int IncrementChangeCounter( ManifestState *pState )
+{
+    int result = EINVAL;
+    VarObject obj;
+
+    if ( pState != NULL )
+    {
+        /* increment the change counter */
+        pState->changeCount++;
+
+        /* write the change counter to the counter variable */
+        obj.type = VARTYPE_UINT32;
+        obj.val.ul = pState->changeCount;
+
+        if ( pState->hCountVar != VAR_INVALID )
+        {
+            result = VAR_Set( pState->hVarServer,
+                              pState->hCountVar,
+                              &obj );
+        }
+        else
+        {
+            result = ENOENT;
+        }
+    }
+
+    return result;
+}
+
+/*============================================================================*/
+/*  FindFileRef                                                               */
+/*!
+    Search for a file reference in the manifest
+
+    The FindFileRef function iterates through all the file references
+    in the manifest looking for the one with the specified identifier.
+    The identifier is assigned by inotify_add_watch at the time the
+    file watch is created.
+
+    @param[in]
+        pState
+            pointer to the Manifest State
+
+    @param[id]
+        id
+            the inotify watch identifier to search for
+
+    @retval pointer to the matching file reference
+    @retval NULL if the file reference could not be found
+
+==============================================================================*/
+static FileRef *FindFileRef( ManifestState *pState, int id )
+{
+    FileRef *pFileRef = NULL;
+
+    if ( pState != NULL )
+    {
+        pFileRef = pState->pManifest;
+        while( pFileRef != NULL )
+        {
+            if ( pFileRef->id == id )
+            {
+                break;
+            }
+
+            pFileRef = pFileRef->pNext;
+        }
+    }
+
+    return pFileRef;
+}
+
+/*============================================================================*/
+/*  AddLogEntry                                                               */
+/*!
+    Add a circular buffer log entry
+
+    The AddLogEntry function adds a change log record to the change log
+    circular buffer.
+
+    @param[in]
+        pState
+            pointer to the Manifest State containing the change log
+
+    @param[id]
+        fd
+            output file descriptor
+
+    @retval EOK entry added ok
+    @retval ENOTSUP no circular buffer available
+    @retval EINVAL invalid arguments
+
+==============================================================================*/
+static int AddLogEntry( ManifestState *pState, int id )
+{
+    int result = EINVAL;
+
+    if ( pState != NULL )
+    {
+        if ( pState->maxEntries > 0 )
+        {
+            /* store an entry in the circular buffer */
+            pState->pChangeLog[pState->in].id = id;
+            pState->pChangeLog[pState->in].t = time(NULL);
+
+            /* indicate success */
+            result = EOK;
+
+            /* increment the input index and wrap it back to the
+               beginning when it reaches the end of the circular buffer */
+            (pState->in)++;
+            if ( pState->in == pState->maxEntries )
+            {
+                /* wrap to beginning */
+                pState->in = 0;
+            }
+
+            /* increment the number of entries in the circular buffer as
+               long as we have not exceeded the buffer capacity */
+            if ( pState->nEntries < pState->maxEntries )
+            {
+                /* increment the number of entries in the circular buffer */
+                pState->nEntries++;
+            }
+            else
+            {
+                /* we have to move the output index forward since the
+                   buffer is full and we just overwrote the oldest
+                   buffer entry */
+                (pState->out)++;
+                if ( pState->out == pState->maxEntries )
+                {
+                    /* wrap output index */
+                    pState->out = 0;
+                }
+            }
+        }
+        else
+        {
+            /* adding entries to the circular buffer is not supported */
+            result = ENOTSUP;
+        }
+    }
+
+    return result;
+}
+
+/*============================================================================*/
+/*  DumpChangeLog                                                             */
+/*!
+    Dump the change log to the output file descriptor
+
+    The DumpChangeLog function writes the change log content
+    to the output file descriptor as a JSON object.
+
+    @param[in]
+        pState
+            pointer to the Manifest State containing the change log
+
+    @param[id]
+        fd
+            output file descriptor
+
+    @retval EOK output generated ok
+    @retval EINVAL invalid arguments
+
+==============================================================================*/
+static int DumpChangeLog( ManifestState *pState, int fd )
+{
+    int result = EINVAL;
+    size_t idx;
+    size_t n;
+    size_t out;
+    FileRef *pFileRef;
+    ChangeLogEntry *entry;
+    int count = 0;
+    char timestr[128];
+
+    /* write the opening brace */
+    write( fd, "[", 1 );
+
+    if ( pState != NULL )
+    {
+        result = EOK;
+
+        n = pState->nEntries;
+        out = pState->out;
+
+        while ( n > 0 )
+        {
+            /* get a pointer to the circular buffer entry */
+            entry = &pState->pChangeLog[out];
+
+            /* look up the file reference */
+            pFileRef = FindFileRef( pState, entry->id );
+            if ( pFileRef != NULL )
+            {
+                /* prepend a comma if necessary */
+                if ( count > 0 )
+                {
+                    write( fd, ",", 1 );
+                }
+
+                /* construct the time string */
+                strftime( timestr,
+                          sizeof( timestr ),
+                          "%A %b %d %H:%M:%S %Y (GMT)",
+                          gmtime( &(entry->t) ) );
+
+                /* output the change log record */
+                dprintf( fd,
+                         "{ \"file\": \"%s\", \"time\" : \"%s\"}",
+                         pFileRef->name,
+                         timestr );
+
+                /* increment the output counter */
+                count++;
+            }
+
+            /* decrement the record counter */
+            n--;
+
+            /* advance the output reference */
+            out++;
+
+            /* wrap the output reference if necessary */
+            if ( out == pState->maxEntries )
+            {
+                out = 0;
+            }
+        }
+    }
+
+    /* write the closing brace */
+    write( fd, "]", 1 );
 
     return result;
 }

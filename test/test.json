@@ -2,9 +2,11 @@
     "manifest" : "manifest1",
     "rendervar" : "/sys/manifest/info",
     "countvar" : "/sys/manifest/changecount",
+    "changelog" : "/sys/manifest/changelog",
     "sources" : [
         "/usr/local/include",
         "/usr/local/bin",
-        "/etc/timezone"
+        "/etc/timezone",
+        "/root/manifest/src/manifest.c"
     ]
 }
