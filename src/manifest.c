@@ -78,7 +78,6 @@ SOFTWARE.
 #include <varserver/varcache.h>
 #include <varserver/varquery.h>
 #include <varserver/varfp.h>
-//#include <openssl/sha.h>
 #include <openssl/evp.h>
 #include "ssl.h"
 
@@ -116,10 +115,44 @@ typedef struct _manifestState
     /*! manifest name */
     char *name;
 
+    /*! render variable */
+    char *renderVarName;
+
+    /*! handle to the render variable */
+    VAR_HANDLE hRenderVar;
+
+    /*! name of the counter variable */
+    char *countVarName;
+
+    /*! handle to the counter variable */
+    VAR_HANDLE hCountVar;
+
     /*! list of FileRef objects which make up the manifest */
     FileRef *pManifest;
 
+    /*! count the number of times a monitored file has changed */
+    size_t changeCount;
+
+    /*! flag to keep the manifest generator service running */
+    bool running;
+
 } ManifestState;
+
+/*! Var Definition object to define a message variable to be created */
+typedef struct _varDef
+{
+    /* name of the variable */
+    char *name;
+
+    /* variable flags to be set */
+    uint32_t flags;
+
+    /*! notification type for the variable */
+    NotificationType notifyType;
+
+    /*! pointer to a location to store the variable handle once it is created */
+    VAR_HANDLE *pVarHandle;
+} VarDef;
 
 /*==============================================================================
         Private file scoped variables
@@ -152,6 +185,16 @@ static int CalcManifest( FileRef *pFileRef );
 static int MakeFileName( char *dirname, char *filename, char *out, size_t len );
 
 static int DumpManifest( ManifestState *pState, int fd );
+
+static int SetupVars( ManifestState *pState );
+VAR_HANDLE SetupVar( ManifestState *pState,
+                     char *name,
+                     uint32_t flags,
+                     NotificationType notify );
+
+static int RunManifestGenerator( ManifestState *pState );
+
+static int HandlePrintRequest( ManifestState *pState, int32_t id );
 
 /*==============================================================================
         Private function definitions
@@ -204,9 +247,10 @@ int main(int argc, char **argv)
             result = ProcessConfigFile( &state, state.pConfigFile );
             if ( result == EOK )
             {
-                DumpManifest( &state, STDOUT_FILENO );
+                /* create varserver variables */
+                SetupVars( &state );
 
-                //RunManifestGenerator( &state );
+                RunManifestGenerator( &state );
             }
         }
 
@@ -352,20 +396,22 @@ static int ProcessConfigFile( ManifestState *pState, char *filename )
         config = JSON_Process( pFileName );
         if ( config != NULL )
         {
+            /* get the render variable name */
+            pState->renderVarName = JSON_GetStr( config, "rendervar" );
+
+            /* get the name of the counter variable */
+            pState->countVarName = JSON_GetStr( config, "countvar" );
+
             /* get the manifest name */
             pState->name = JSON_GetStr(config, "manifest");
-            if ( pState->name != NULL )
-            {
-                printf("manifest: %s\n", pState->name );
 
-                /* get the sources list */
-                node = JSON_Find( config, "sources" );
-                if ( node->type == JSON_ARRAY )
-                {
-                    /* process the sources list */
-                    pSources = (JArray *)node;
-                    result = ProcessSources( pState, pSources );
-                }
+            /* get the sources list */
+            node = JSON_Find( config, "sources" );
+            if ( node->type == JSON_ARRAY )
+            {
+                /* process the sources list */
+                pSources = (JArray *)node;
+                result = ProcessSources( pState, pSources );
             }
         }
     }
@@ -924,6 +970,255 @@ static void TerminationHandler( int signum, siginfo_t *info, void *ptr )
     }
 
     exit( 1 );
+}
+
+/*============================================================================*/
+/*  SetupVars                                                                 */
+/*!
+    Set up the manifest variables
+
+    The SetupVars function creates and configures the manifest variables
+
+    @param[in]
+        pState
+            pointer to the Manifest State object
+
+    @retval
+        EOK - message variable successfully created
+        EINVAL - invalid arguments
+
+==============================================================================*/
+static int SetupVars( ManifestState *pState )
+{
+    int result = EINVAL;
+    int errcount = 0;
+    int i;
+    int n;
+    VAR_HANDLE *pVarHandle;
+
+    VarDef vars[] =
+    {
+        {  pState->renderVarName,
+           VARFLAG_VOLATILE,
+           NOTIFY_PRINT,
+           &(pState->hRenderVar) },
+
+        { pState->countVarName,
+          VARFLAG_VOLATILE,
+          NOTIFY_NONE,
+          &(pState->hCountVar ) }
+    };
+
+    n = sizeof( vars ) / sizeof( vars[0] );
+
+    if ( pState != NULL )
+    {
+        for ( i=0 ; i < n ; i++ )
+        {
+            if ( vars[i].name != NULL )
+            {
+                /* get a pointer to the location to store the variable handle */
+                pVarHandle = vars[i].pVarHandle;
+                if ( pVarHandle != NULL )
+                {
+                    /* create a message variable */
+                    *pVarHandle = SetupVar( pState,
+                                            vars[i].name,
+                                            vars[i].flags,
+                                            vars[i].notifyType );
+                    if ( *pVarHandle == VAR_INVALID )
+                    {
+                        printf("Error creating variable: %s\n", vars[i].name );
+                        errcount++;
+                    }
+                }
+            }
+        }
+    }
+
+    if ( errcount == 0 )
+    {
+        result = EOK;
+    }
+
+    return result;
+}
+
+/*============================================================================*/
+/*  SetupVar                                                                  */
+/*!
+    Set up a variable
+
+    The SetupVar function creates a varserver variable to be used to
+    interact with the manifest generator.
+    The variable may or may not have a notification associated with it.
+
+@param[in]
+    pState
+        pointer to the Manifest State object
+
+@param[in]
+    name
+        specify the variable name to create
+
+@param[in]
+    flags
+        flags to add to the variable flag set
+
+@param[in]
+    notify
+        specify the notification type.  Use NOTIFY_NONE if no notification is
+        required
+
+==============================================================================*/
+VAR_HANDLE SetupVar( ManifestState *pState,
+                     char *name,
+                     uint32_t flags,
+                     NotificationType notify )
+{
+    VAR_HANDLE hVar = VAR_INVALID;
+    VarInfo info;
+    int result;
+    size_t len;
+
+    if ( ( pState != NULL ) &&
+         ( name != NULL ) )
+    {
+        len = strlen( name );
+        if ( len < sizeof( info.name ) )
+        {
+            memset( &info, 0, sizeof( VarInfo ) );
+
+            info.flags = flags;
+            info.var.type = VARTYPE_UINT32;
+
+            /* set the variable name */
+            strcpy( info.name, name );
+
+            /* create the variable */
+            result = VARSERVER_CreateVar( pState->hVarServer, &info );
+            if ( result == EOK )
+            {
+                hVar = info.hVar;
+            }
+
+            if ( hVar == VAR_INVALID )
+            {
+                hVar = VAR_FindByName( pState->hVarServer, info.name );
+            }
+
+            if ( ( hVar != VAR_INVALID ) &&
+                    ( notify != NOTIFY_NONE ) )
+            {
+                /* set up variable notification */
+                result = VAR_Notify( pState->hVarServer, hVar, notify );
+                if ( result != EOK )
+                {
+                    printf( "VARMSG: Failed to set up notification for '%s'\n",
+                            info.name );
+                }
+            }
+        }
+    }
+
+    return hVar;
+}
+
+/*============================================================================*/
+/*  RunManifestGenerator                                                      */
+/*!
+    Run the manifest generator service
+
+    The RunManifestGenerator function waits for notifications from the
+    variable server or from a file which has been modified
+
+    @param[in]
+        pState
+            pointer to the Manifest State
+
+    @retval EOK the manifest generator exited successfully
+    @retval EINVAL invalid arguments
+
+==============================================================================*/
+static int RunManifestGenerator( ManifestState *pState )
+{
+    int result = EINVAL;
+    int fd;
+    int signum;
+    int32_t sigval;
+    VAR_HANDLE hVar;
+
+    if ( pState != NULL )
+    {
+        fd = VARSERVER_Signalfd();
+
+        /* assume everything is ok until it is not */
+        result = EOK;
+
+        pState->running = true;
+        while ( pState->running == true )
+        {
+            signum = VARSERVER_WaitSignalfd( fd, &sigval );
+            if ( signum == SIG_VAR_PRINT )
+            {
+                /* handle a PRINT request */
+                result = HandlePrintRequest( pState, sigval );
+            }
+        }
+    }
+
+    return result;
+}
+
+/*============================================================================*/
+/*  HandlePrintRequest                                                        */
+/*!
+    Handle a varserver print request notification
+
+    The HandlePrintRequest function handles a print request notification
+    from the variable server.
+
+    @param[in]
+        pState
+            pointer to the Manifest State
+
+    @param[in]
+        id
+            print notification identifier
+
+    @retval EOK print request notification handled successfully
+    @retval EINVAL invalid arguments
+
+==============================================================================*/
+static int HandlePrintRequest( ManifestState *pState, int32_t id )
+{
+    int result = EINVAL;
+    VAR_HANDLE hVar;
+    int fd;
+
+    if ( pState != NULL )
+    {
+        /* open a print session */
+        if ( VAR_OpenPrintSession( pState->hVarServer,
+                                   id,
+                                   &hVar,
+                                   &fd ) == EOK )
+        {
+            result = ENOENT;
+
+            if ( hVar == pState->hRenderVar )
+            {
+                DumpManifest( pState, fd );
+            }
+
+            /* Close the print session */
+            result = VAR_ClosePrintSession( pState->hVarServer,
+                                            id,
+                                            fd );
+        }
+    }
+
+    return result;
 }
 
 /*! @}
