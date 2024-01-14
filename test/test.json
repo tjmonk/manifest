@@ -3,6 +3,7 @@
     "rendervar" : "/sys/manifest/info",
     "countvar" : "/sys/manifest/changecount",
     "changelog" : "/sys/manifest/changelog",
+    "changelogsize" : 10,
     "sources" : [
         "/usr/local/include",
         "/usr/local/bin",
