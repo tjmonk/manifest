@@ -1,0 +1,7 @@
+{
+    "manifest" : "manifest3",
+    "rendervar" : "/sys/manifest3/info",
+    "sources" : [
+        "/root/manifest/src/manifest.c"
+    ]
+}
