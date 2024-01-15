@@ -1,13 +1,29 @@
-{
-    "manifest" : "manifest1",
-    "rendervar" : "/sys/manifest/info",
-    "countvar" : "/sys/manifest/changecount",
-    "changelog" : "/sys/manifest/changelog",
-    "changelogsize" : 10,
-    "sources" : [
-        "/usr/local/include",
-        "/usr/local/bin",
-        "/etc/timezone",
-        "/root/manifest/src/manifest.c"
-    ]
-}
+[
+    {
+        "manifest" : "manifest1",
+        "rendervar" : "/sys/manifest/info",
+        "countvar" : "/sys/manifest/changecount",
+        "diffvar" : "/sys/manifest/diff",
+        "diffcountvar" : "/sys/manifest/diffcount",
+        "changelog" : "/sys/manifest/changelog",
+        "changelogsize" : 10,
+        "changelogfile" : "/tmp/manifest_changelog.txt",
+        "baselinefile" : "/tmp/manifest_baseline.txt",
+        "manifestfile" : "/tmp/manifest.txt",
+        "dynamicfile" : true,
+        "sources" : [
+            "/root/manifest/src/manifest.c"
+        ]
+    },
+    {
+        "manifest" : "manifest2",
+        "rendervar" : "/sys/manifest2/info",
+        "countvar" : "/sys/manifest2/changecount",
+        "changelog" : "/sys/manifest2/changelog",
+        "changelogsize" : 100,
+        "sources" : [
+            "/etc/passwd",
+            "/usr/local/include/varserver/varserver.h"
+        ]
+    }
+]

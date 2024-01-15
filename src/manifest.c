@@ -95,6 +95,9 @@ typedef struct _fileRef
     /*! calculated SHA256 */
     char sha[65];
 
+    /*! baseline SHA256 loaded from baseline file */
+    char baseline[65];
+
     /*! file watch id */
     int id;
 
@@ -142,6 +145,18 @@ typedef struct _manifest
     /*! handle to the change log render variable */
     VAR_HANDLE hChangeLog;
 
+    /*! name of the baseline mismatch counter variable */
+    char *diffCountVarName;
+
+    /*! handle to the baseline mismatch counter variable */
+    VAR_HANDLE hBaselineMismatchCount;
+
+    /*! name of the baseline difference list */
+    char *diffVarName;
+
+    /*! handle to the baseline difference variable */
+    VAR_HANDLE hBaselineDiff;
+
     /*! list of FileRef objects which make up the manifest */
     FileRef *pFileRef;
 
@@ -160,8 +175,20 @@ typedef struct _manifest
     /*! indicate end of the circular log */
     size_t out;
 
-    /* pointer to the change log */
+    /*! pointer to the change log */
     ChangeLogEntry *pChangeLog;
+
+    /*! manifest baseline file (written once) */
+    char *baseline;
+
+    /*! manifest output file */
+    char *manifestfile;
+
+    /*! change log file name */
+    char *changelogfile;
+
+    /*! dynamic file output */
+    bool dynamicfile;
 
     /*! pointer to the next manifest in the list */
     struct _manifest *pNext;
@@ -210,6 +237,11 @@ typedef struct _varDef
     VAR_HANDLE *pVarHandle;
 } VarDef;
 
+#ifndef MANIFEST_TIME_FORMAT_STRING
+/*! time format string for the manifest change log timestamp */
+#define MANIFEST_TIME_FORMAT_STRING "%A %b %d %H:%M:%S %Y (GMT)"
+#endif
+
 /*==============================================================================
         Private file scoped variables
 ==============================================================================*/
@@ -234,7 +266,10 @@ static int InitReadFds( ManifestState *pState, fd_set *fds );
 
 static int ProcessSources( Manifest *pManifest, JArray *pSources );
 static int ProcessConfigFile( ManifestState *pState, char *filename );
-
+static int ProcessManifestArray( ManifestState *pState,
+                                 JArray *pArray,
+                                 char *filename );
+static int ProcessManifestConfig( ManifestState *pState, JNode *config );
 static Manifest *CreateManifest( JNode *pConfig );
 
 static int AddSource( Manifest *pManifest, char *name );
@@ -256,6 +291,10 @@ VAR_HANDLE SetupVar( VARSERVER_HANDLE hVarServer,
 
 static int RunManifestGenerator( ManifestState *pState );
 
+static int HandleINotifyEvent( Manifest *pManifest,
+                               const struct inotify_event *event,
+                               VARSERVER_HANDLE hVarServer );
+
 static int HandlePrintRequest( ManifestState *pState, int32_t id );
 
 static int PrintManifestInfo( VAR_HANDLE hVar, Manifest *pManifest, int fd );
@@ -265,12 +304,28 @@ static int HandleFileNotification( VARSERVER_HANDLE hVarServer,
 
 static FileRef *FindFileRef( Manifest *pManifest, int id );
 
+static int HandleFileChange( Manifest *pManifest,
+                             FileRef *pFileRef,
+                             VARSERVER_HANDLE hVarServer );
+
 static int IncrementChangeCounter( VARSERVER_HANDLE hVarServer,
                                    Manifest *pManifest );
 
 static int DumpChangeLog( Manifest *pManifest, int fd );
 
-static int AddLogEntry( Manifest *pManifest, int id );
+static int AddLogEntry( Manifest *pManifest, int id, time_t timestamp );
+
+static int AppendChangeLogFile( Manifest *pManifest, int id, time_t timestamp );
+
+static int WriteManifestFile( Manifest *pManifest,
+                              char *filename,
+                              bool checkExists );
+
+static int LoadBaseline( Manifest *pManifest );
+
+static int CompareBaseline( Manifest *pManifest, VARSERVER_HANDLE hVarServer );
+
+static int WriteBaselineDiff( Manifest *pManifest, int fd );
 
 /*==============================================================================
         Private function definitions
@@ -323,10 +378,7 @@ int main(int argc, char **argv)
             result = ProcessConfigFile( &state, state.pConfigFile );
             if ( result == EOK )
             {
-                /* create varserver variables */
-                SetupVars( state.hVarServer, state.pManifest );
-
-                RunManifestGenerator( &state );
+                (void)RunManifestGenerator( &state );
             }
         }
 
@@ -360,7 +412,6 @@ static void usage( char *cmdname )
                  "usage: %s [-v] [-h] [-f config file] [-d config dir]\n"
                  " [-h] : display this help\n"
                  " [-v] : verbose output\n"
-                 " [-n] : max log entries\n"
                  " [-f] : specify the manifest configuration file\n",
                  cmdname );
     }
@@ -472,42 +523,228 @@ static int ProcessConfigFile( ManifestState *pState, char *filename )
         config = JSON_Process( pFileName );
         if ( config != NULL )
         {
-            /* parse and create the manifest */
-            pManifest = CreateManifest( config );
-            if ( pManifest != NULL )
+            if ( config->type == JSON_ARRAY )
             {
-                /* set up variables for the manifest */
-                SetupVars( pState->hVarServer, pManifest );
+                /* process the array of manifest definitions */
+                result = ProcessManifestArray( pState,
+                                               (JArray *)config,
+                                               pFileName );
+            }
+            else if ( config->type == JSON_OBJECT )
+            {
+                /* process a single manifest definition */
+                result = ProcessManifestConfig( pState, config );
+            }
 
-                if ( pState->verbose == true )
+            if ( result != EOK )
+            {
+                fprintf( stderr,
+                         "Failed to process manifest: %s\n",
+                         pFileName );
+            }
+
+            if ( pState->verbose == true )
+            {
+                printf("Processed Config: %s\n", pFileName );
+            }
+        }
+    }
+
+    return result;
+}
+
+/*============================================================================*/
+/*  ProcessManifestArray                                                      */
+/*!
+    Process an array of manifest definitions
+
+    The ProcessManifestArray function processes an array of manifest
+    definitions.
+
+    @param[in]
+        pState
+            pointer to the Manifest Generator state
+
+    @param[in]
+        pArray
+            pointer to the Manifest definition JSON Array
+
+    @param[in]
+        filename
+            pointer to the name of the file to load
+
+    @retval EINVAL invalid arguments
+    @retval EOK file processed ok
+    @retval other error as returned by ProcessConfigData
+
+==============================================================================*/
+static int ProcessManifestArray( ManifestState *pState,
+                                 JArray *pArray,
+                                 char *filename )
+{
+    int result = EINVAL;
+    int n;
+    int i;
+    JNode *pConfig;
+    int rc;
+
+    if ( ( pState != NULL ) &&
+         ( pArray != NULL ) &&
+         ( filename != NULL ) )
+    {
+        /* set default error code */
+        result = ENOENT;
+
+        /* handle an array of manifest definitions */
+        n = JSON_GetArraySize( (JArray *)pArray );
+        if ( n > 0 )
+        {
+            /* assume everything is ok until it is not */
+            result = EOK;
+
+            /* iterate through the manifest definitions */
+            for ( i = 0; i < n ; i++ )
+            {
+                /* get a single manifest definition */
+                pConfig = JSON_Index( pArray, i );
+                if ( pConfig != NULL )
                 {
-                    printf("Created Manifest: %s\n", pFileName );
+                    /* process a manifest definition */
+                    rc = ProcessManifestConfig( pState, pConfig );
+                    if ( rc != EOK )
+                    {
+                        /* capture the error code */
+                        result = rc;
+
+                        fprintf( stderr,
+                                    "Failed to process manifest %d "
+                                    "in configuration: %s\n",
+                                    i,
+                                    filename );
+                    }
+                }
+            }
+        }
+    }
+
+    return result;
+}
+
+/*============================================================================*/
+/*  ProcessManifestConfig                                                     */
+/*!
+    Process a manifest definition
+
+    The ProcessManifestConfig function processes a manifest configuration
+    definition to create a new manifest object.
+
+    @param[in]
+        pState
+            pointer to the Manifest Generator state
+
+    @param[in]
+        config
+            pointer to a JSON object containing a manifest definition
+
+    @retval EINVAL invalid arguments
+    @retval EOK manifest definition processed ok
+
+==============================================================================*/
+static int ProcessManifestConfig( ManifestState *pState, JNode *config )
+{
+    int result = EINVAL;
+    Manifest *pManifest;
+    int rc;
+
+    if ( ( pState != NULL ) &&
+         ( config != NULL ) )
+    {
+        /* assume everything is ok until it is not */
+        result = EOK;
+
+        /* parse and create the manifest */
+        pManifest = CreateManifest( config );
+        if ( pManifest != NULL )
+        {
+            /* write the baseline manifest file */
+            if ( pManifest->baseline != NULL )
+            {
+                rc = WriteManifestFile( pManifest,
+                                        pManifest->baseline,
+                                        true );
+                if ( rc == EEXIST )
+                {
+                    rc = EOK;
                 }
 
-                /* insert the manifest at the head of the manifest list */
-                if ( pState->pManifest == NULL )
+                if ( rc != EOK )
                 {
-                    pState->pManifest = pManifest;
-                }
-                else
-                {
-                    pManifest->pNext = pState->pManifest;
-                    pState->pManifest = pManifest;
-                }
+                    fprintf( stderr,
+                             "Failed to write manifest baseline: %s\n",
+                             pManifest->baseline );
 
-                result = EOK;
+                    result = rc;
+                }
+            }
+
+            /* write the manifest file */
+            if ( pManifest->manifestfile != NULL )
+            {
+                rc = WriteManifestFile( pManifest,
+                                        pManifest->manifestfile,
+                                        false );
+                if ( rc != EOK )
+                {
+                    fprintf( stderr,
+                             "Failed to write manifest file: %s\n",
+                             pManifest->manifestfile );
+
+                    result = rc;
+                }
+            }
+
+            /* load the baseline manifest */
+            rc = LoadBaseline( pManifest );
+            if ( ( rc != EOK ) && ( rc != ENOTSUP ) )
+            {
+                result = rc;
+            }
+
+            /* set up variables for the manifest */
+            rc = SetupVars( pState->hVarServer, pManifest );
+            if ( rc != EOK )
+            {
+                fprintf( stderr, "Failed to setup manifest variables\n");
+                result = rc;
+            }
+
+            /* perform initial baseline comparison */
+            rc = CompareBaseline( pManifest, pState->hVarServer );
+            if ( ( rc != EOK ) && ( rc != ENOTSUP ) )
+            {
+                result = rc;
+            }
+
+            /* insert the manifest at the head of the manifest list */
+            if ( pState->pManifest == NULL )
+            {
+                pState->pManifest = pManifest;
             }
             else
             {
-                fprintf( stderr,
-                         "Failed to create manifest from %s\n",
-                         pFileName );
+                pManifest->pNext = pState->pManifest;
+                pState->pManifest = pManifest;
             }
         }
         else
         {
-            fprintf( stderr, "Failed to process file: %s\n", pFileName );
+            fprintf( stderr, "Failed to create manifest\n" );
+            result = EBADMSG;
         }
+    }
+    else
+    {
+        fprintf( stderr, "Failed to process manifest\n" );
     }
 
     return result;
@@ -574,8 +811,26 @@ static Manifest *CreateManifest( JNode *pConfig )
             /* get the name of the counter variable */
             pManifest->countVarName = JSON_GetStr( pConfig, "countvar" );
 
+            /* get the name of the baseline difference variable */
+            pManifest->diffVarName = JSON_GetStr( pConfig, "diffvar" );
+
             /* get the name of the name of the change log variable */
             pManifest->changeLogName = JSON_GetStr( pConfig, "changelog" );
+
+            /* get the name of the baseline mismatch count variable */
+            pManifest->diffCountVarName = JSON_GetStr( pConfig, "diffcountvar");
+
+            /* get the manifest baseline filename */
+            pManifest->baseline = JSON_GetStr( pConfig, "baselinefile" );
+
+            /* get the manifest output file */
+            pManifest->manifestfile = JSON_GetStr( pConfig, "manifestfile" );
+
+            /* get the manifest changelog file */
+            pManifest->changelogfile = JSON_GetStr( pConfig, "changelogfile" );
+
+            /* get the dynamic file flag to re-write manifest file on change */
+            pManifest->dynamicfile = JSON_GetBool( pConfig, "dynamicfile" );
 
             /* get the change log size */
             JSON_GetNum( pConfig, "changelogsize", &n );
@@ -1078,9 +1333,8 @@ static int CalcManifest( FileRef *pFileRef )
             output file descriptor
 
     @retval EINVAL invalid arguments
-    @retval EOK digest processed ok
-    @retval ENOMEM memory allocation failure
-    @retval EBADF cannot open file
+    @retval EOK manifest output ok
+    @retval EBADF invalid file descriptor
 
 ==============================================================================*/
 static int DumpManifest( Manifest *pManifest, int fd )
@@ -1236,7 +1490,17 @@ static int SetupVars( VARSERVER_HANDLE hVarServer, Manifest *pManifest )
             { pManifest->countVarName,
             VARFLAG_VOLATILE,
             NOTIFY_NONE,
-            &(pManifest->hCountVar ) }
+            &(pManifest->hCountVar ) },
+
+            { pManifest->diffCountVarName,
+            VARFLAG_VOLATILE,
+            NOTIFY_NONE,
+            &(pManifest->hBaselineMismatchCount ) },
+
+            { pManifest->diffVarName,
+            VARFLAG_VOLATILE,
+            NOTIFY_PRINT,
+            &(pManifest->hBaselineDiff ) }
         };
 
         n = sizeof( vars ) / sizeof( vars[0] );
@@ -1380,6 +1644,7 @@ static int RunManifestGenerator( ManifestState *pState )
     int32_t sigval;
     VAR_HANDLE hVar;
     fd_set readfds;
+    int rc;
     int n;
 
     if ( pState != NULL )
@@ -1409,7 +1674,11 @@ static int RunManifestGenerator( ManifestState *pState )
                     if ( signum == SIG_VAR_PRINT )
                     {
                         /* handle a PRINT request */
-                        result = HandlePrintRequest( pState, sigval );
+                        rc = HandlePrintRequest( pState, sigval );
+                        if ( rc != EOK )
+                        {
+                            result = rc;
+                        }
                     }
 
                 } while ( signum != -1 );
@@ -1421,8 +1690,12 @@ static int RunManifestGenerator( ManifestState *pState )
                 if ( FD_ISSET( pManifest->notifyfd, &readfds ) )
                 {
                     /* handle an inotify watch notification on a file */
-                    result = HandleFileNotification( pState->hVarServer,
-                                                     pManifest );
+                    rc = HandleFileNotification( pState->hVarServer,
+                                                 pManifest );
+                    if ( rc != EOK )
+                    {
+                        result = rc;
+                    }
                 }
 
                 pManifest = pManifest->pNext;
@@ -1600,6 +1873,10 @@ static int PrintManifestInfo( VAR_HANDLE hVar, Manifest *pManifest, int fd )
         {
             DumpChangeLog( pManifest, fd );
         }
+        else if ( hVar == pManifest->hBaselineDiff )
+        {
+            WriteBaselineDiff( pManifest, fd );
+        }
     }
 
     return result;
@@ -1642,9 +1919,7 @@ static int HandleFileNotification( VARSERVER_HANDLE hVarServer,
     ssize_t len;
     bool done = false;
     char *ptr;
-    FileRef *pFileRef;
-    VarObject obj;
-    char sha[65];
+    int rc;
 
     if ( ( hVarServer != NULL ) &&
          ( pManifest != NULL ) )
@@ -1667,36 +1942,191 @@ static int HandleFileNotification( VARSERVER_HANDLE hVarServer,
                 {
                     /* get a pointer to an inotify_event to process */
                     event = (const struct inotify_event *) ptr;
-                    if ( event->mask & IN_CLOSE_WRITE )
+
+                    /* handle the inotify event */
+                    rc = HandleINotifyEvent( pManifest, event, hVarServer );
+                    if ( ( rc != EOK ) && ( rc != ENOENT ) )
                     {
-                        /* find the appropriate file reference */
-                        pFileRef = FindFileRef( pManifest, event->wd );
-                        if ( pFileRef != NULL )
-                        {
-                            /* store the old SHA-256 */
-                            strcpy( sha, pFileRef->sha );
-
-                            /* update the manifest */
-                            result = CalcManifest( pFileRef );
-                            if ( result == EOK )
-                            {
-                                if ( strcmp( sha, pFileRef->sha ) != 0 )
-                                {
-                                    /* Add log entry */
-                                    AddLogEntry( pManifest, pFileRef->id );
-
-                                    /* increment the change count */
-                                    result = IncrementChangeCounter(hVarServer,
-                                                                    pManifest );
-                                }
-                            }
-                        }
+                        /* capture all errors except ENOENT which is allowed */
+                        result = rc;
                     }
 
                     /* move to the next inotify event */
                     ptr += sizeof(struct inotify_event) + event->len;
                 }
             }
+        }
+    }
+
+    return result;
+}
+
+/*============================================================================*/
+/*  HandleINotifyEvent                                                        */
+/*!
+    Handle a single received inotify event
+
+    The HandleINotifyEvent function searches the FileRef list for the
+    inotify identifier.  If the identifier is found a new SHA-256
+    is calculated for the associated file. If the SHA-256 is different
+    from its previous value, the HandleFileChange function is called
+    to update the manifest state.
+
+    @param[in]
+        pManifest
+            pointer to the manifest to update
+
+    @param[in]
+        event
+            pointer to the inotify_event to process
+
+    @param[in]
+        hVarServer
+            handle to the variable server
+
+    @retval EOK file notification handled successfully
+    @retval EINVAL invalid arguments
+
+==============================================================================*/
+static int HandleINotifyEvent( Manifest *pManifest,
+                               const struct inotify_event *event,
+                               VARSERVER_HANDLE hVarServer )
+{
+    int result = EINVAL;
+    FileRef *pFileRef;
+    char sha[65];
+
+    if ( ( pManifest != NULL ) &&
+         ( event != NULL ) &&
+         ( hVarServer != NULL ) )
+    {
+        /* assume result is ok until it is not */
+        result = EOK;
+
+        /* check if the event is a write close event */
+        if ( event->mask & IN_CLOSE_WRITE )
+        {
+            /* find the appropriate file reference */
+            pFileRef = FindFileRef( pManifest, event->wd );
+            if ( pFileRef != NULL )
+            {
+                /* store the old SHA-256 */
+                strcpy( sha, pFileRef->sha );
+
+                /* update the manifest */
+                result = CalcManifest( pFileRef );
+                if ( result == EOK )
+                {
+                    /* check for a file change */
+                    if ( strcmp( sha, pFileRef->sha ) != 0 )
+                    {
+                        /* handle the file change */
+                        result = HandleFileChange( pManifest,
+                                                   pFileRef,
+                                                   hVarServer );
+                    }
+                }
+            }
+            else
+            {
+                /* the notification was not found for this manifest */
+                result = ENOENT;
+            }
+        }
+    }
+
+    return result;
+}
+
+/*============================================================================*/
+/*  HandleFileChange                                                          */
+/*!
+    Handle a changed file monitored by the manifest
+
+    The HandleFileChange function performs actions when a monitored
+    file has changed.  The actions include:
+
+    - adding a changelog entry to the runtime circular buffer
+    - writing an entry to the changelog file
+    - re-writing the manifest file
+    - incrementing the change counter
+
+    @param[in]
+        pManifest
+            pointer to the manifest to update
+
+    @param[in]
+        pFileRef
+            pointer to the FileRef object for the changed file
+
+    @param[in]
+        hVarServer
+            handle to the variable server
+
+    @retval EOK file notification handled successfully
+    @retval EINVAL invalid arguments
+
+==============================================================================*/
+static int HandleFileChange( Manifest *pManifest,
+                             FileRef *pFileRef,
+                             VARSERVER_HANDLE hVarServer )
+{
+    int result = EINVAL;
+    time_t timestamp;
+    int rc;
+
+    if ( ( pManifest != NULL ) &&
+         ( pFileRef != NULL ) &&
+         ( hVarServer != NULL ) )
+    {
+        /* assume everything is ok until it is not */
+        result = EOK;
+
+        /* get the timestamp */
+        timestamp = time( NULL );
+
+        /* Add log entry */
+        rc = AddLogEntry( pManifest,
+                          pFileRef->id,
+                          timestamp );
+        if ( ( rc != EOK ) && ( rc != ENOTSUP ) )
+        {
+            result = rc;
+        }
+
+        /* append the change to the log file */
+        rc = AppendChangeLogFile( pManifest,
+                                  pFileRef->id,
+                                  timestamp );
+        if ( ( rc != EOK ) && ( rc != ENOTSUP ) )
+        {
+            result = rc;
+        }
+
+        if ( pManifest->dynamicfile == true )
+        {
+            /* write out a new manifest file */
+            rc = WriteManifestFile( pManifest,
+                                    pManifest->manifestfile,
+                                    false );
+            if ( ( rc != EOK ) && ( rc != ENOTSUP ) )
+            {
+                result = rc;
+            }
+        }
+
+        /* perform baseline comparison (if enabled) */
+        rc = CompareBaseline( pManifest, hVarServer );
+        if ( ( rc != EOK ) && ( rc != ENOTSUP ) )
+        {
+            result = rc;
+        }
+
+        /* increment the change count */
+        rc = IncrementChangeCounter(hVarServer, pManifest );
+        if ( ( rc != EOK ) && ( rc != ENOTSUP ) )
+        {
+            result = rc;
         }
     }
 
@@ -1720,7 +2150,7 @@ static int HandleFileNotification( VARSERVER_HANDLE hVarServer,
             pointer to the Manifest to update
 
     @retval EOK the change counter was incremented
-    @retval ENOENT no change counter was found
+    @retval ENOTSUP no change counter was found
     @retval EINVAL invalid arguments
 
 ==============================================================================*/
@@ -1747,7 +2177,7 @@ static int IncrementChangeCounter( VARSERVER_HANDLE hVarServer,
         }
         else
         {
-            result = ENOENT;
+            result = ENOTSUP;
         }
     }
 
@@ -1768,7 +2198,7 @@ static int IncrementChangeCounter( VARSERVER_HANDLE hVarServer,
         pManifest
             pointer to the Manifest to search
 
-    @param[id]
+    @param[in]
         id
             the inotify watch identifier to search for
 
@@ -1809,18 +2239,25 @@ static FileRef *FindFileRef( Manifest *pManifest, int id )
         pManifest
             pointer to the Manifest containing the change log
 
-    @param[id]
-        fd
-            output file descriptor
+    @param[in]
+        id
+            the inotify watch identifier
+
+    @param[in]
+        timestamp
+            the entry timestamp
 
     @retval EOK entry added ok
     @retval ENOTSUP no circular buffer available
     @retval EINVAL invalid arguments
 
 ==============================================================================*/
-static int AddLogEntry( Manifest *pManifest, int id )
+static int AddLogEntry( Manifest *pManifest, int id, time_t timestamp )
 {
     int result = EINVAL;
+    time_t now;
+    int fd;
+    FileRef *pFileRef;
 
     if ( pManifest != NULL )
     {
@@ -1829,7 +2266,7 @@ static int AddLogEntry( Manifest *pManifest, int id )
         {
             /* store an entry in the circular buffer */
             pManifest->pChangeLog[pManifest->in].id = id;
-            pManifest->pChangeLog[pManifest->in].t = time(NULL);
+            pManifest->pChangeLog[pManifest->in].t = timestamp;
 
             /* indicate success */
             result = EOK;
@@ -1874,6 +2311,90 @@ static int AddLogEntry( Manifest *pManifest, int id )
 }
 
 /*============================================================================*/
+/*  AppendChangeLogFile                                                               */
+/*!
+    Append an entry to the change log file
+
+    The AppendChangeLogFile function adds a CSV change log record to the
+    change log file.
+
+    @param[in]
+        pManifest
+            pointer to the Manifest containing the change log file name
+
+    @param[in]
+        id
+            the inotify watch identifier
+
+    @param[in]
+        timestamp
+            the entry timestamp
+
+    @retval EOK entry added ok
+    @retval ENOTSUP the change log file is not enabled
+    @retval ENOENT file reference not found
+    @retval EINVAL invalid arguments
+    @retval other error from open()
+
+==============================================================================*/
+static int AppendChangeLogFile( Manifest *pManifest, int id, time_t timestamp )
+{
+    time_t now;
+    int fd;
+    FileRef *pFileRef;
+    char timestr[128];
+    int result = EINVAL;
+
+    if ( pManifest != NULL )
+    {
+        if ( pManifest->changelogfile != NULL )
+        {
+            /* look up the file reference */
+            pFileRef = FindFileRef( pManifest, id );
+            if ( ( pFileRef != NULL ) &&
+                 ( pFileRef->name != NULL ) )
+            {
+                /* construct the time string */
+                strftime( timestr,
+                        sizeof( timestr ),
+                        MANIFEST_TIME_FORMAT_STRING,
+                        gmtime( &timestamp ) );
+
+                /* open the file in append mode and create it if it
+                    does not exist */
+                fd = open( pManifest->changelogfile,
+                        O_WRONLY | O_APPEND | O_CREAT );
+                if ( fd != -1 )
+                {
+                    dprintf( fd,
+                             "%s, %s\n",
+                             timestr,
+                             pFileRef->name );
+
+                    result = EOK;
+                }
+                else
+                {
+                    result = errno;
+                }
+
+                close( fd );
+            }
+            else
+            {
+                result = ENOENT;
+            }
+        }
+        else
+        {
+            result = ENOTSUP;
+        }
+    }
+
+    return result;
+}
+
+/*============================================================================*/
 /*  DumpChangeLog                                                             */
 /*!
     Dump the change log to the output file descriptor
@@ -1885,7 +2406,7 @@ static int AddLogEntry( Manifest *pManifest, int id )
         pManifest
             pointer to the Manifest containing the change log
 
-    @param[id]
+    @param[in]
         fd
             output file descriptor
 
@@ -1934,7 +2455,7 @@ static int DumpChangeLog( Manifest *pManifest, int fd )
                     /* construct the time string */
                     strftime( timestr,
                             sizeof( timestr ),
-                            "%A %b %d %H:%M:%S %Y (GMT)",
+                            MANIFEST_TIME_FORMAT_STRING,
                             gmtime( &(entry->t) ) );
 
                     /* output the change log record */
@@ -1964,6 +2485,307 @@ static int DumpChangeLog( Manifest *pManifest, int fd )
 
     /* write the closing brace */
     write( fd, "]", 1 );
+
+    return result;
+}
+
+/*============================================================================*/
+/*  WriteManifestFile                                                         */
+/*!
+    Write the manifest to an output file
+
+    The WriteManifestFile function writes the manifest out to the specified
+    file. If the checkExists flag is set and the file already exists,
+    then the file will not be output.
+
+    @param[in]
+        pManifest
+            pointer to the Manifest to output
+
+    @param[in]
+        filename
+            pointer to the output filename
+
+    @param[in]
+        checkExists
+            true : check if the file exists and suppress output if it does
+            false : always write the file
+
+    @retval EOK manifest output ok
+    @retval EEXIST the output file already exists
+    @retval EBADF invalid file descriptor
+    @retval EINVAL invalid arguments
+    @retval other error from open()
+
+==============================================================================*/
+static int WriteManifestFile( Manifest *pManifest,
+                              char *filename,
+                              bool checkExists )
+{
+    int result = EINVAL;
+    struct stat sb;
+    int fd;
+
+    if ( ( pManifest != NULL ) &&
+         ( filename != NULL ) )
+    {
+        if ( checkExists == true )
+        {
+            /* check if the file exists */
+            result = stat( filename, &sb );
+            if ( result == EOK )
+            {
+                result = EEXIST;
+            }
+        }
+
+        if ( result != EEXIST )
+        {
+            /* open the file in write only mode and create it if it
+                does not exist */
+            fd = open( filename, O_WRONLY | O_CREAT );
+            if ( fd != -1 )
+            {
+                /* truncate the file */
+                ftruncate( fd, 0 );
+
+                /* output the manifest */
+                result = DumpManifest( pManifest, fd );
+
+                close( fd );
+            }
+            else
+            {
+                result = errno;
+            }
+        }
+    }
+
+    return result;
+}
+
+/*============================================================================*/
+/*  LoadBaseline                                                              */
+/*!
+    Load the baseline manifest
+
+    The LoadBaseline function loads the baseline manifest SHAs into the
+    current manifest to be used to determine which files have changed
+    from the baseline.
+
+    @param[in]
+        pManifest
+            pointer to the Manifest to load the baseline for
+
+    @retval EOK baseline loaded ok
+    @retval ENOTSUP the baseline is not enabled
+    @retval E2BIG one or more baseline SHAs are too long
+    @retval ENOENT one or more files were not found in the baseline
+    @retval EINVAL invalid arguments
+
+==============================================================================*/
+static int LoadBaseline( Manifest *pManifest )
+{
+    int result = EINVAL;
+    JNode *pBaseline;
+    FileRef *pFileRef;
+    char *pSha;
+    size_t len;
+
+    if ( pManifest != NULL )
+    {
+        if ( pManifest->baseline != NULL )
+        {
+            /* load the baseline file */
+            pBaseline = JSON_Process( pManifest->baseline );
+            if ( pBaseline != NULL )
+            {
+                result = EOK;
+
+                pFileRef = pManifest->pFileRef;
+                while ( pFileRef != NULL )
+                {
+                    /* get the file baseline SHA */
+                    pSha = JSON_GetStr( pBaseline, pFileRef->name );
+                    if ( pSha != NULL )
+                    {
+                        /* get the length of the baseline SHA */
+                        len = strlen( pSha );
+                        if ( len < sizeof( pFileRef->baseline ) )
+                        {
+                            /* update the baseline SHA in the FileRef */
+                            strcpy( pFileRef->baseline, pSha );
+                        }
+                        else
+                        {
+                            /* not enough room for the baseline SHA */
+                            result = E2BIG;
+                        }
+                    }
+                    else
+                    {
+                        /* baseline SHA not found */
+                        memset( pFileRef->baseline,
+                                0,
+                                sizeof( pFileRef->baseline ) );
+
+                        result = ENOENT;
+                    }
+
+                    /* move to the next file reference */
+                    pFileRef = pFileRef->pNext;
+                }
+            }
+
+            JSON_Free( pBaseline );
+        }
+        else
+        {
+            result = ENOTSUP;
+        }
+    }
+
+    return result;
+}
+
+/*============================================================================*/
+/*  CompareBaseline                                                           */
+/*!
+    Compare the current manifest against the baseline
+
+    The CompareBaseline function compares the current manifest against
+    the baseline manifest and counts the number of SHA entries which
+    do not match. i.e the number of changed files.
+
+    It updates the baseline mismatch counter variable.
+
+    This function requires that the baseline has been established,
+    and the baseline mismatch counter variable exists, both of
+    which are optional configurations.
+
+    @param[in]
+        pManifest
+            pointer to the Manifest to compare the baseline for
+
+    @param[in]
+        hVarServer
+            handle to the variable server
+
+    @retval EOK baseline comparison completed ok
+    @retval ENOTSUP the baseline comparison is not enabled
+    @retval EINVAL invalid arguments
+
+==============================================================================*/
+static int CompareBaseline( Manifest *pManifest, VARSERVER_HANDLE hVarServer )
+{
+    int result = EINVAL;
+    uint32_t count = 0;
+    FileRef *pFileRef;
+    size_t len;
+    VarObject obj;
+
+    if ( pManifest != NULL )
+    {
+        if ( ( pManifest->baseline != NULL ) &&
+             ( pManifest->hBaselineMismatchCount != VAR_INVALID ) )
+        {
+            /* get a pointer to the first file in the manifest */
+            pFileRef = pManifest->pFileRef;
+            while( pFileRef != NULL )
+            {
+                /* check the current SHA against the baseline SHA */
+                if ( strcmp( pFileRef->sha, pFileRef->baseline ) != 0 )
+                {
+                    /* increment the mismatch counter */
+                    count++;
+                }
+
+                /* check the next file reference */
+                pFileRef = pFileRef->pNext;
+            }
+
+            /* update the baseline compare variable */
+            obj.type = VARTYPE_UINT32;
+            obj.val.ul = count;
+            result = VAR_Set( hVarServer,
+                            pManifest->hBaselineMismatchCount,
+                            &obj );
+        }
+        else
+        {
+            /* baseline comparison is not enabled */
+            result = ENOTSUP;
+        }
+    }
+
+    return result;
+}
+
+/*============================================================================*/
+/*  WriteBaselineDiff                                                         */
+/*!
+    Write the baseline difference list
+
+    The WriteBaselineDiff function writes a JSON list of file names
+    which do not match the reference baseline.  Note that if the
+    baseline is not enabled, this will be the full list of files
+    in the manifest set.
+
+    @param[in]
+        pManifest
+            pointer to the Manifest to write the baseline difference for
+
+    @param[in]
+        fd
+            output file descriptor
+
+    @retval EOK baseline difference was written ok
+    @retval EBADF invalid output file descriptor
+    @retval EINVAL invalid arguments
+
+==============================================================================*/
+static int WriteBaselineDiff( Manifest *pManifest, int fd )
+{
+    int result = EINVAL;
+    FileRef *pFileRef;
+    int count = 0;
+
+    if ( pManifest != NULL )
+    {
+        if ( fd != -1 )
+        {
+            /* output the JSON opening list brace */
+            write( fd, "[", 1);
+
+            pFileRef = pManifest->pFileRef;
+            while( pFileRef != NULL )
+            {
+                if ( strcmp( pFileRef->sha, pFileRef->baseline ) != 0 )
+                {
+                    if ( count++ != 0 )
+                    {
+                        /* prepend comma separator */
+                        write( fd, ",", 1 );
+                    }
+
+                    dprintf( fd, "\"%s\"", pFileRef->name );
+                }
+
+                /* move to the next file reference in the manifest */
+                pFileRef = pFileRef->pNext;
+            }
+
+            /* output the JSON closing list brace */
+            write( fd, "]", 1 );
+
+            /* indicate success */
+            result = EOK;
+        }
+        else
+        {
+            result = EBADF;
+        }
+    }
 
     return result;
 }
