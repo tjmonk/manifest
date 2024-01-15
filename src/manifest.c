@@ -219,6 +219,9 @@ typedef struct _manifestState
     /*! variable server file descriptor */
     int varserverfd;
 
+    /*! number of manifests we are handling */
+    size_t numManifests;
+
 } ManifestState;
 
 /*! Var Definition object to define a message variable to be created */
@@ -265,6 +268,7 @@ static void SetupTerminationHandler( void );
 static int InitReadFds( ManifestState *pState, fd_set *fds );
 
 static int ProcessSources( Manifest *pManifest, JArray *pSources );
+static int ProcessConfigDir( ManifestState *pState, char *dirname );
 static int ProcessConfigFile( ManifestState *pState, char *filename );
 static int ProcessManifestArray( ManifestState *pState,
                                  JArray *pArray,
@@ -376,10 +380,30 @@ int main(int argc, char **argv)
         {
             /* Process the configuration file */
             result = ProcessConfigFile( &state, state.pConfigFile );
-            if ( result == EOK )
+            if ( result != EOK )
             {
-                (void)RunManifestGenerator( &state );
+                fprintf( stderr,
+                         "Error processing config file: %s\n",
+                         state.pConfigFile );
             }
+        }
+
+        if ( state.pConfigDir != NULL )
+        {
+            /* Process the configuration directory */
+            result = ProcessConfigDir( &state, state.pConfigDir );
+            if ( result != EOK )
+            {
+                fprintf( stderr,
+                         "Error processing config dir: %s\n",
+                         state.pConfigDir );
+            }
+        }
+
+        if ( state.numManifests > 0 )
+        {
+            /* wait for and processs manifest events */
+            (void)RunManifestGenerator( &state );
         }
 
         /* close the handle to the variable server */
@@ -412,7 +436,8 @@ static void usage( char *cmdname )
                  "usage: %s [-v] [-h] [-f config file] [-d config dir]\n"
                  " [-h] : display this help\n"
                  " [-v] : verbose output\n"
-                 " [-f] : specify the manifest configuration file\n",
+                 " [-f] : specify the manifest configuration file\n"
+                 " [-d] : specify the manifest configuration directory\n",
                  cmdname );
     }
 }
@@ -445,7 +470,7 @@ static int ProcessOptions( int argC, char *argV[], ManifestState *pState )
 {
     int c;
     int result = EINVAL;
-    const char *options = "hvf:";
+    const char *options = "hvf:d:";
 
     if( ( pState != NULL ) &&
         ( argV != NULL ) )
@@ -466,6 +491,10 @@ static int ProcessOptions( int argC, char *argV[], ManifestState *pState )
                     pState->pConfigFile = strdup(optarg);
                     break;
 
+                case 'd':
+                    pState->pConfigDir = strdup(optarg);
+                    break;
+
                 default:
                     break;
             }
@@ -473,6 +502,87 @@ static int ProcessOptions( int argC, char *argV[], ManifestState *pState )
     }
 
     return 0;
+}
+
+/*============================================================================*/
+/*  ProcessConfigDir                                                          */
+/*!
+    Process all of the manifest configurations in the specified directory
+
+    The ProcessConfigDir function processes all of the manfiest configuration
+    files in the specified directory.
+
+    @param[in]
+        pState
+            pointer to the Manifest Generator state
+
+    @param[in]
+        dirname
+            pointer to the name of the directory to process
+
+    @retval EINVAL invalid arguments
+    @retval ENOENT the directory could not be opened
+    @retval EOK file processed ok
+    @retval other error as returned by ProcessConfigData
+
+==============================================================================*/
+static int ProcessConfigDir( ManifestState *pState, char *dirname )
+{
+    int result = EINVAL;
+    struct dirent *entry;
+    DIR *pDir;
+    struct stat sb;
+    char filename[BUFSIZ];
+    int rc;
+
+    if ( ( pState != NULL ) &&
+         ( dirname != NULL ) )
+    {
+        /* set the default error code */
+        result = ENOENT;
+
+        /* open the specified directory */
+        pDir = opendir( dirname );
+        if( pDir != NULL )
+        {
+            /* assume everything is ok until it isnt */
+            result = EOK;
+
+            /* iterate through the directory entries */
+            while( entry = readdir( pDir ) )
+            {
+                /* construct the file name from the directory name
+                   and the file name */
+                rc = MakeFileName( dirname,
+                                   entry->d_name,
+                                   filename,
+                                   sizeof( filename ) );
+                if ( rc == EOK )
+                {
+                    /* stat the file name */
+                    rc = stat( filename, &sb );
+                    if ( ( rc == 0 ) &&
+                         ( ( sb.st_mode & S_IFMT ) == S_IFREG ) )
+                    {
+                        /* process the configuration file */
+                        rc = ProcessConfigFile( pState, filename );
+                        if ( rc != EOK )
+                        {
+                            fprintf( stderr,
+                                     "Error processing %s\n",
+                                     filename );
+                            result = rc;
+                        }
+                    }
+                }
+            }
+
+            /* close the directory */
+            closedir( pDir );
+        }
+    }
+
+    return result;
 }
 
 /*============================================================================*/
@@ -725,15 +835,21 @@ static int ProcessManifestConfig( ManifestState *pState, JNode *config )
                 result = rc;
             }
 
-            /* insert the manifest at the head of the manifest list */
-            if ( pState->pManifest == NULL )
+            if ( result == EOK )
             {
-                pState->pManifest = pManifest;
-            }
-            else
-            {
-                pManifest->pNext = pState->pManifest;
-                pState->pManifest = pManifest;
+                /* increment the number of manifests we are handling */
+                pState->numManifests++;
+
+                /* insert the manifest at the head of the manifest list */
+                if ( pState->pManifest == NULL )
+                {
+                    pState->pManifest = pManifest;
+                }
+                else
+                {
+                    pManifest->pNext = pState->pManifest;
+                    pState->pManifest = pManifest;
+                }
             }
         }
         else
