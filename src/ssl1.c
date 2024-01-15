@@ -100,10 +100,9 @@ int CalcSHA256( FILE *fp, char *out, size_t outlen )
 {
     int result = EINVAL;
     int min_len = ( SHA256_DIGEST_LENGTH * 2 ) + 1;
-    char *buffer = NULL;
     SHA256_CTX sha256;
     const int bufSize = 32768;
-    unsigned char *buffer;
+    unsigned char *buffer = NULL;
     int bytesRead = 0;
     unsigned char hash[SHA256_DIGEST_LENGTH];
     int i;

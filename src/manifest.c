@@ -331,6 +331,8 @@ static int CompareBaseline( Manifest *pManifest, VARSERVER_HANDLE hVarServer );
 
 static int WriteBaselineDiff( Manifest *pManifest, int fd );
 
+static void Output( int fd, char *buf, size_t len );
+
 /*==============================================================================
         Private function definitions
 ==============================================================================*/
@@ -1465,7 +1467,7 @@ static int DumpManifest( Manifest *pManifest, int fd )
         result = EINVAL;
 
         /* output the start of the JSON object */
-        write( fd, "{", 1 );
+        Output( fd, "{", 1 );
 
         if ( pManifest != NULL )
         {
@@ -1476,7 +1478,7 @@ static int DumpManifest( Manifest *pManifest, int fd )
                 if ( count > 0 )
                 {
                     /* prepend a comma */
-                    write( fd, ",", 1 );
+                    Output( fd, ",", 1 );
                 }
 
                 /* generate the filename and SHA */
@@ -1491,7 +1493,7 @@ static int DumpManifest( Manifest *pManifest, int fd )
         }
 
         /* output the end of the JSON object */
-        write( fd, "}", 1 );
+        Output( fd, "}", 1 );
     }
 
     return result;
@@ -2479,7 +2481,8 @@ static int AppendChangeLogFile( Manifest *pManifest, int id, time_t timestamp )
                 /* open the file in append mode and create it if it
                     does not exist */
                 fd = open( pManifest->changelogfile,
-                        O_WRONLY | O_APPEND | O_CREAT );
+                           O_WRONLY | O_APPEND | O_CREAT,
+                           0644 );
                 if ( fd != -1 )
                 {
                     dprintf( fd,
@@ -2542,7 +2545,7 @@ static int DumpChangeLog( Manifest *pManifest, int fd )
     char timestr[128];
 
     /* write the opening brace */
-    write( fd, "[", 1 );
+    Output( fd, "[", 1 );
 
     if ( pManifest != NULL )
     {
@@ -2565,7 +2568,7 @@ static int DumpChangeLog( Manifest *pManifest, int fd )
                     /* prepend a comma if necessary */
                     if ( count > 0 )
                     {
-                        write( fd, ",", 1 );
+                        Output( fd, ",", 1 );
                     }
 
                     /* construct the time string */
@@ -2600,7 +2603,7 @@ static int DumpChangeLog( Manifest *pManifest, int fd )
     }
 
     /* write the closing brace */
-    write( fd, "]", 1 );
+    Output( fd, "]", 1 );
 
     return result;
 }
@@ -2659,14 +2662,19 @@ static int WriteManifestFile( Manifest *pManifest,
         {
             /* open the file in write only mode and create it if it
                 does not exist */
-            fd = open( filename, O_WRONLY | O_CREAT );
+            fd = open( filename, O_WRONLY | O_CREAT, 0644 );
             if ( fd != -1 )
             {
                 /* truncate the file */
-                ftruncate( fd, 0 );
-
-                /* output the manifest */
-                result = DumpManifest( pManifest, fd );
+                if ( ftruncate( fd, 0 ) == 0 )
+                {
+                    /* output the manifest */
+                    result = DumpManifest( pManifest, fd );
+                }
+                else
+                {
+                    result = errno;
+                }
 
                 close( fd );
             }
@@ -2871,7 +2879,7 @@ static int WriteBaselineDiff( Manifest *pManifest, int fd )
         if ( fd != -1 )
         {
             /* output the JSON opening list brace */
-            write( fd, "[", 1);
+            Output( fd, "[", 1);
 
             pFileRef = pManifest->pFileRef;
             while( pFileRef != NULL )
@@ -2881,7 +2889,7 @@ static int WriteBaselineDiff( Manifest *pManifest, int fd )
                     if ( count++ != 0 )
                     {
                         /* prepend comma separator */
-                        write( fd, ",", 1 );
+                        Output( fd, ",", 1 );
                     }
 
                     dprintf( fd, "\"%s\"", pFileRef->name );
@@ -2892,7 +2900,7 @@ static int WriteBaselineDiff( Manifest *pManifest, int fd )
             }
 
             /* output the JSON closing list brace */
-            write( fd, "]", 1 );
+            Output( fd, "]", 1 );
 
             /* indicate success */
             result = EOK;
@@ -2904,6 +2912,43 @@ static int WriteBaselineDiff( Manifest *pManifest, int fd )
     }
 
     return result;
+}
+
+/*============================================================================*/
+/*  Output                                                                    */
+/*!
+    Output a buffer to an output file descriptor
+
+    The Output function wraps the write() system call and performs
+    error checking.
+
+    @param[in]
+        fd
+            output file descriptor
+
+    @param[in]
+        buf
+            pointer to output buffer
+
+    @param[in]
+        len
+            number of bytes to write
+
+==============================================================================*/
+static void Output( int fd, char *buf, size_t len )
+{
+    int n;
+
+    if ( ( buf != NULL ) &&
+         ( fd != -1 ) &&
+         ( len > 0 ) )
+    {
+        n = write( fd, buf, len );
+        if ( (size_t)n != len )
+        {
+            fprintf( stderr, "write failed\n" );
+        }
+    }
 }
 
 /*! @}
