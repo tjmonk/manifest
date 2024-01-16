@@ -1337,6 +1337,7 @@ static int AddFile( Manifest *pManifest, char *name )
 {
     FileRef *pFileRef;
     int result = EINVAL;
+    char *dupname;
 
     if ( ( pManifest != NULL ) &&
          ( name != NULL ) )
@@ -1345,8 +1346,8 @@ static int AddFile( Manifest *pManifest, char *name )
         pFileRef = calloc( 1, sizeof( FileRef ) );
         if ( pFileRef != NULL )
         {
-            /* set the file name */
-            pFileRef->name = name;
+            /* assign the file reference name */
+            pFileRef->name = strdup( name );
 
             /* perform digest */
             result = CalcManifest( pFileRef );
@@ -1371,6 +1372,11 @@ static int AddFile( Manifest *pManifest, char *name )
                              "Error watching %s: %s\n",
                              pFileRef->name,
                              strerror(result) );
+
+                    if ( pFileRef->name != NULL )
+                    {
+                        free( pFileRef->name );
+                    }
 
                     free( pFileRef );
                 }
