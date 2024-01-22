@@ -117,6 +117,19 @@ typedef struct _fileRef
     struct _fileRef *pNext;
 } FileRef;
 
+/*! The DirRef object tracks all of the directories that we are watching */
+typedef struct _dirRef
+{
+    /*! directory name */
+    char *name;
+
+    /*! directory watch id */
+    int id;
+
+    /*! pointer to next directory */
+    struct _dirRef *pNext;
+} DirRef;
+
 /*! change log entry */
 typedef struct _changeLogEntry
 {
@@ -183,6 +196,9 @@ typedef struct _manifest
 
     /*! list of FileRef objects which make up the manifest */
     FileRef *pFileRef;
+
+    /*! list of DirRef objects which are being tracked by the manifest */
+    DirRef *pDirRef;
 
     /*! number of files being monitored */
     size_t nFiles;
@@ -326,6 +342,7 @@ static int AddToManifest( Manifest *pManifest, FileRef *pFileRef );
 static int AddSource( Manifest *pManifest, char *name );
 static int AddDir( Manifest *pManifest, char *name );
 static int AddFile( Manifest *pManifest, char *name );
+static int AddDirWatch( Manifest *pManifest, char *name );
 
 static int ProcessBaselineEntry( Manifest *pManifest, char *pName, char *pSHA );
 
@@ -333,7 +350,10 @@ static int AddBaselineSHA( FileRef *pFileRef, char *pSHA );
 
 static int CalcManifest( FileRef *pFileRef );
 
-static int MakeFileName( char *dirname, char *filename, char *out, size_t len );
+static int MakeFileName( const char *dirname,
+                         const char *filename,
+                         char *out,
+                         size_t len );
 
 static int DumpManifest( Manifest *pManifest, int fd );
 
@@ -352,6 +372,18 @@ static int HandleINotifyEvent( Manifest *pManifest,
                                const struct inotify_event *event,
                                VARSERVER_HANDLE hVarServer );
 
+static int HandleCreateEvent( Manifest *pManifest,
+                              const struct inotify_event *event,
+                              VARSERVER_HANDLE hVarServer );
+
+static int HandleDeleteEvent( Manifest *pManifest,
+                              const struct inotify_event *event,
+                              VARSERVER_HANDLE hVarServer );
+
+static int HandleCloseWriteEvent( Manifest *pManifest,
+                                  int id,
+                                  VARSERVER_HANDLE hVarServer );
+
 static int HandlePrintRequest( ManifestState *pState, int32_t id );
 
 static int PrintManifestInfo( VAR_HANDLE hVar, Manifest *pManifest, int fd );
@@ -360,6 +392,7 @@ static int HandleFileNotification( VARSERVER_HANDLE hVarServer,
                                    Manifest *pManifest );
 
 static FileRef *FindFileRef( Manifest *pManifest, int id );
+static DirRef *FindDirRef( Manifest *pManifest, int id );
 
 static int HandleFileChange( Manifest *pManifest,
                              FileRef *pFileRef,
@@ -1251,7 +1284,10 @@ static int AddSource( Manifest *pManifest, char *name )
     @retval EOK sources processed ok
 
 ==============================================================================*/
-static int MakeFileName( char *dirname, char *filename, char *out, size_t len )
+static int MakeFileName( const char *dirname,
+                         const char *filename,
+                         char *out,
+                         size_t len )
 {
     int result = EINVAL;
     size_t n;
@@ -1340,6 +1376,12 @@ static int AddDir( Manifest *pManifest, char *name )
     if ( ( pManifest != NULL ) &&
          ( name != NULL ) )
     {
+        rc = AddDirWatch( pManifest, name );
+        if ( rc == -1 )
+        {
+            fprintf( stderr, "Failed to add watch: %s\n", name );
+        }
+
         pDir = opendir( name );
         if( pDir != NULL )
         {
@@ -1393,6 +1435,84 @@ static int AddDir( Manifest *pManifest, char *name )
 
     return result;
 }
+
+/*============================================================================*/
+/*  AddDirWatch                                                               */
+/*!
+    Add a watch to a directory
+
+    The AddDirWatch function adds an inotify watch to the specified directory
+    checking for additions and deletions to that directory.
+
+    @param[in]
+        pManifest
+            pointer to the Manifest to add the files to
+
+    @param[in]
+        name
+            name of the directory to add
+
+    @retval EINVAL invalid arguments
+    @retval EOK directory added ok
+
+==============================================================================*/
+static int AddDirWatch( Manifest *pManifest, char *name )
+{
+    int result = EINVAL;
+    int rc;
+    DirRef *pDirRef;
+
+    if ( ( pManifest != NULL ) &&
+         ( name != NULL ) )
+    {
+        /* allocate a DirRef object */
+        pDirRef = calloc( 1, sizeof( DirRef ) );
+        if ( pDirRef != NULL )
+        {
+            /* set the directory name */
+            pDirRef->name = strdup( name );
+            if ( pDirRef->name != NULL )
+            {
+                /* set up the watch */
+                pDirRef->id = inotify_add_watch( pManifest->notifyfd,
+                                                 name,
+                                                 IN_CREATE | IN_DELETE );
+                if ( pDirRef->id != -1 )
+                {
+                    if ( pManifest->pDirRef == NULL )
+                    {
+                        pManifest->pDirRef = pDirRef;
+                    }
+                    else
+                    {
+                        pDirRef->pNext = pManifest->pDirRef;
+                        pManifest->pDirRef = pDirRef;
+                    }
+
+                    result = EOK;
+                }
+            }
+        }
+
+        if ( result != EOK )
+        {
+            if ( pDirRef != NULL )
+            {
+                if ( pDirRef->name != NULL )
+                {
+                    free( pDirRef->name );
+                    pDirRef->name = NULL;
+                }
+
+                free( pDirRef );
+                pDirRef = NULL;
+            }
+        }
+    }
+
+    return result;
+}
+
 
 /*============================================================================*/
 /*  NewFileRef                                                                */
@@ -2373,11 +2493,8 @@ static int HandleFileNotification( VARSERVER_HANDLE hVarServer,
 /*!
     Handle a single received inotify event
 
-    The HandleINotifyEvent function searches the FileRef list for the
-    inotify identifier.  If the identifier is found a new SHA-256
-    is calculated for the associated file. If the SHA-256 is different
-    from its previous value, the HandleFileChange function is called
-    to update the manifest state.
+    The HandleINotifyEvent function dispatches a received event to the
+    appropriate event handler.
 
     @param[in]
         pManifest
@@ -2391,7 +2508,8 @@ static int HandleFileNotification( VARSERVER_HANDLE hVarServer,
         hVarServer
             handle to the variable server
 
-    @retval EOK file notification handled successfully
+    @retval EOK notification handled successfully
+    @retval ENOENT not handled by this manifest
     @retval EINVAL invalid arguments
 
 ==============================================================================*/
@@ -2401,33 +2519,291 @@ static int HandleINotifyEvent( Manifest *pManifest,
 {
     int result = EINVAL;
     FileRef *pFileRef;
-    char sha[65];
 
     if ( ( pManifest != NULL ) &&
          ( event != NULL ) &&
          ( hVarServer != NULL ) )
     {
-        /* assume result is ok until it is not */
-        result = EOK;
+        /* default error */
+        result = ENOTSUP;
 
         /* check if the event is a write close event */
         if ( event->mask & IN_CLOSE_WRITE )
         {
-            /* find the appropriate file reference */
-            pFileRef = FindFileRef( pManifest, event->wd );
-            if ( pFileRef != NULL )
-            {
-                /* store the old SHA-256 */
-                strcpy( sha, pFileRef->sha );
+            result = HandleCloseWriteEvent( pManifest, event->wd, hVarServer );
 
-                /* update the manifest */
-                result = CalcManifest( pFileRef );
+            /* return ENOENT to allow other manifests a chance to handle this */
+            result = ENOENT;
+
+        }
+        else if ( event->mask & IN_CREATE )
+        {
+            result = HandleCreateEvent( pManifest, event, hVarServer );
+
+            /* return ENOENT to allow other manifests a chance to handle this */
+            result = ENOENT;
+        }
+        else if ( event->mask & IN_DELETE )
+        {
+            result = HandleDeleteEvent( pManifest, event, hVarServer );
+
+            /* return ENOENT to allow other manifests a chance to handle this */
+            result = ENOENT;
+        }
+    }
+
+    return result;
+}
+
+/*============================================================================*/
+/*  HandleCloseWriteEvent                                                     */
+/*!
+    Handle an IN_CLOSE_WRITE event from inotify
+
+    The HandleCloseWriteEvent function searches the FileRef list for the
+    inotify identifier.  If the identifier is found a new SHA-256
+    is calculated for the associated file. If the SHA-256 is different
+    from its previous value, the HandleFileChange function is called
+    to update the manifest state.
+
+    @param[in]
+        pManifest
+            pointer to the manifest to update
+
+    @param[in]
+        id
+            an inotify identifier corresponding to a watched file
+
+    @param[in]
+        hVarServer
+            handle to the variable server
+
+    @retval EOK file notification handled successfully
+    @retval EINVAL invalid arguments
+
+==============================================================================*/
+static int HandleCloseWriteEvent( Manifest *pManifest,
+                                  int id,
+                                  VARSERVER_HANDLE hVarServer )
+{
+    int result = EINVAL;
+    FileRef *pFileRef;
+    char sha[MANIFEST_SHA_LEN];
+
+    if ( pManifest != NULL )
+    {
+        /* find the appropriate file reference */
+        pFileRef = FindFileRef( pManifest, id );
+        if ( pFileRef != NULL )
+        {
+            /* store the old SHA-256 */
+            strcpy( sha, pFileRef->sha );
+
+            /* update the manifest */
+            result = CalcManifest( pFileRef );
+            if ( result == EOK )
+            {
+                /* check for a file change */
+                if ( strcmp( sha, pFileRef->sha ) != 0 )
+                {
+                    /* handle the file change */
+                    result = HandleFileChange( pManifest,
+                                               pFileRef,
+                                               hVarServer );
+                }
+            }
+        }
+        else
+        {
+            /* the notification was not found for this manifest */
+            result = ENOENT;
+        }
+    }
+
+    return result;
+}
+
+/*============================================================================*/
+/*  FindDirRef                                                                */
+/*!
+    Search for a directory reference in the manifest
+
+    The FindDirRef function iterates through all the directory references
+    in the manifest looking for the one with the specified identifier.
+    The identifier is assigned by inotify_add_watch at the time the
+    directory watch is created.
+
+    @param[in]
+        pManifest
+            pointer to the Manifest to search
+
+    @param[in]
+        id
+            the inotify watch identifier to search for
+
+    @retval pointer to the matching directory reference
+    @retval NULL if the directory reference could not be found
+
+==============================================================================*/
+static DirRef *FindDirRef( Manifest *pManifest, int id )
+{
+    DirRef *pDirRef = NULL;
+
+    if ( pManifest != NULL )
+    {
+        /* get a pointer to the first directory reference object */
+        pDirRef = pManifest->pDirRef;
+        while( pDirRef != NULL )
+        {
+            if( pDirRef->id == id )
+            {
+                /* found it! */
+                break;
+            }
+
+            /* look in the next directory reference object */
+            pDirRef = pDirRef->pNext;
+        }
+    }
+
+    return pDirRef;
+}
+
+/*============================================================================*/
+/*  HandleCreateEvent                                                         */
+/*!
+    Handle an inotify IN_CREATE event on a directory
+
+    The HandleCreateEvent function constructs a fully qualified file name
+    from the DirRef and the event file name, and adds this file as a watched
+    file within the manifest.
+
+    @param[in]
+        pManifest
+            pointer to the manifest to update
+
+    @param[in]
+        event
+            pointer to the received inotify_event structure
+
+    @param[in]
+        hVarServer
+            handle to the variable server
+
+    @retval EOK create event notification handled successfully
+    @retval EINVAL invalid arguments
+    @retval ENOTSUP no directory name
+    @retval E2BIG file name cannot be constructed
+
+==============================================================================*/
+static int HandleCreateEvent( Manifest *pManifest,
+                              const struct inotify_event *event,
+                              VARSERVER_HANDLE hVarServer )
+{
+    char filename[PATH_MAX];
+    int result = EINVAL;
+    DirRef *pDirRef;
+    int rc;
+
+    if ( ( pManifest != NULL ) &&
+         ( event != NULL ) )
+    {
+        /* search for a matching directory reference in the manifest */
+        pDirRef = FindDirRef( pManifest, event->wd );
+        if ( pDirRef != NULL )
+        {
+            if ( pDirRef->name != NULL )
+            {
+                /* construct a fully qualified file name from the directory
+                   reference name, and the filename from the event */
+                result = MakeFileName( pDirRef->name,
+                                       event->name,
+                                       filename,
+                                       sizeof( filename ) );
                 if ( result == EOK )
                 {
-                    /* check for a file change */
-                    if ( strcmp( sha, pFileRef->sha ) != 0 )
+                    /* add a new file to be monitored within the manifest */
+                    result = AddFile( pManifest, filename );
+                }
+            }
+            else
+            {
+                result = ENOTSUP;
+            }
+        }
+        else
+        {
+            result = ENOENT;
+        }
+    }
+
+    return result;
+}
+
+/*============================================================================*/
+/*  HandleDeleteEvent                                                         */
+/*!
+    Handle an inotify IN_DELETE event on a directory
+
+    The HandleDeleteEvent function constructs a fully qualified file name
+    from the DirRef and the event file name, searches for the FileRef
+    within the manifest, and if found, updates the SHA as "DELETED"
+    and then performs the file change handling to update the manifest
+    status.
+
+    @param[in]
+        pManifest
+            pointer to the manifest to update
+
+    @param[in]
+        event
+            pointer to the received inotify_event structure
+
+    @param[in]
+        hVarServer
+            handle to the variable server
+
+    @retval EOK delete event notification handled successfully
+    @retval EINVAL invalid arguments
+    @retval ENOTSUP no directory name
+    @retval E2BIG file name cannot be constructed
+
+==============================================================================*/
+static int HandleDeleteEvent( Manifest *pManifest,
+                              const struct inotify_event *event,
+                              VARSERVER_HANDLE hVarServer )
+{
+    char filename[PATH_MAX];
+    int result = EINVAL;
+    DirRef *pDirRef;
+    FileRef *pFileRef;
+    int rc;
+
+    if ( ( pManifest != NULL ) &&
+         ( event != NULL ) )
+    {
+        /* find the directory reference corresponding to the event */
+        pDirRef = FindDirRef( pManifest, event->wd );
+        if ( pDirRef != NULL )
+        {
+            if ( pDirRef->name != NULL )
+            {
+                /* construct a fully qualified file name */
+                result = MakeFileName( pDirRef->name,
+                                       event->name,
+                                       filename,
+                                       sizeof( filename ) );
+                if ( result == EOK )
+                {
+                    /* get the file reference from the
+                        manifest hash table */
+                    pFileRef = HashFind( pManifest, filename );
+                    if ( pFileRef != NULL )
                     {
-                        /* handle the file change */
+                        /* mark the file as deleted */
+                        strcpy(pFileRef->sha, "DELETED" );
+
+                        /* handle file change manifest updates */
                         result = HandleFileChange( pManifest,
                                                    pFileRef,
                                                    hVarServer );
@@ -2436,9 +2812,12 @@ static int HandleINotifyEvent( Manifest *pManifest,
             }
             else
             {
-                /* the notification was not found for this manifest */
-                result = ENOENT;
+                result = ENOTSUP;
             }
+        }
+        else
+        {
+            result = ENOENT;
         }
     }
 
