@@ -90,9 +90,13 @@ SOFTWARE.
 ==============================================================================*/
 
 #ifndef MANIFEST_SHA_LEN
+/*! length of the manifest SHA digest string */
 #define MANIFEST_SHA_LEN  ( 65 )
 #endif
 
+/*! The FileRef object tracks a single file reference digest containing
+    the file's name baseline and current digest, and reference to the
+    inotify identifier */
 typedef struct _fileRef
 {
     /*! file name specifier */
@@ -130,7 +134,7 @@ typedef struct _dirRef
     struct _dirRef *pNext;
 } DirRef;
 
-/*! change log entry */
+/*! The ChangeLogEntry stores a single file change report */
 typedef struct _changeLogEntry
 {
     /*! time of change */
@@ -336,6 +340,10 @@ static int ProcessManifestArray( ManifestState *pState,
 static int ProcessManifestConfig( ManifestState *pState, JNode *config );
 static Manifest *CreateManifest( JNode *pConfig );
 
+static FileRef *UpdateFileRef( Manifest *pManifest,
+                               char *pFileName,
+                               char *pBaseline,
+                               char *pSHA );
 static FileRef *NewFileRef( char *pFileName, char *pBaseline, char *pSHA );
 static int AddToManifest( Manifest *pManifest, FileRef *pFileRef );
 
@@ -603,7 +611,7 @@ static int ProcessOptions( int argC, char *argV[], ManifestState *pState )
 /*!
     Process all of the manifest configurations in the specified directory
 
-    The ProcessConfigDir function processes all of the manfiest configuration
+    The ProcessConfigDir function processes all of the manifest configuration
     files in the specified directory.
 
     @param[in]
@@ -976,9 +984,16 @@ static int ProcessManifestConfig( ManifestState *pState, JNode *config )
     manifest (string) : name of the manifest
     rendervar (string) : name of the variable used to render the manifest
     countvar (string) : name of the variable used to count manifest changes
+    diffvar (string) : name of the variable used to render manifest differences
+    diffcountvar (string): name of the variable used to count differences
+    statsvar (string) : name of the variable used to render manifest stats
     changelog (string) : name of the variable used to render the change log
     changeLogSize (integer) : number of entries to use for the change log
                               circular buffer
+    baselinefile (string) : name of the (optional) output baseline file
+    manifestfile (string) : name of the (optional) output manifest file
+    dynamicfile (boolean) : if true, regenerate manifest file on change
+    mapsize (int) : size of the manifest hash map
     sources: (array) : array of (string) source names
 
     @param[in]
@@ -1194,7 +1209,7 @@ static int ProcessSources( Manifest *pManifest, JArray *pSources )
 /*!
     Add a source reference to the manifest
 
-    The AddSource function adds a source reference to the manfest.
+    The AddSource function adds a source reference to the manifest.
     The source could refer to a file or a directory.  In the case of a
     directory, all of the files in the directory will be added but any
     directory will be ignored.
@@ -1513,7 +1528,6 @@ static int AddDirWatch( Manifest *pManifest, char *name )
     return result;
 }
 
-
 /*============================================================================*/
 /*  NewFileRef                                                                */
 /*!
@@ -1604,6 +1618,85 @@ static FileRef *NewFileRef( char *pFileName, char *pBaseline, char *pSHA )
 }
 
 /*============================================================================*/
+/*  UpdateFileRef                                                             */
+/*!
+    Update a FileRef object
+
+    The UpdateFileRef function searches for an existing file reference
+    and updates the baseline SHA and, and the current SHA, if they are
+    specified. If a FileRef is not found, it will create a new one using
+    NewFileRef.
+
+    @param[in]
+        pManifest
+            pointer to the manifest to get the existing FileRef from
+
+    @param[in]
+        pFileName
+            pointer to the file name of the new File Reference object
+
+    @param[in]
+        pBaseline
+            (optional) pointer to the baseline SHA
+
+    @param[in]
+        pSHA
+            (optional) pointer to the current SHA
+
+    @retval pointer to the new file reference
+    @retval NULL if the file reference object could not be created
+
+==============================================================================*/
+static FileRef *UpdateFileRef( Manifest *pManifest,
+                               char *pFileName,
+                               char *pBaseline,
+                               char *pSHA )
+{
+    FileRef *pFileRef = NULL;
+    size_t len;
+
+    if ( ( pManifest != NULL ) &&
+         ( pFileName != NULL ) )
+    {
+        /* see if the file reference already exists */
+        pFileRef = HashFind( pManifest, pFileName );
+        if ( pFileRef != NULL )
+        {
+            if ( ( pManifest->notifyfd > 0 ) &&
+                 ( pFileRef->id > 0 ) )
+            {
+                inotify_rm_watch( pManifest->notifyfd, pFileRef->id );
+                pFileRef->id = 0;
+            }
+
+            if ( pBaseline != NULL )
+            {
+                len = strlen( pBaseline );
+                if ( len < MANIFEST_SHA_LEN )
+                {
+                    strcpy( pFileRef->baseline, pBaseline );
+                }
+            }
+
+            if ( pSHA != NULL )
+            {
+                len = strlen( pSHA );
+                if ( len < MANIFEST_SHA_LEN )
+                {
+                    strcpy( pFileRef->sha, pSHA );
+                }
+            }
+        }
+        else
+        {
+            pFileRef = NewFileRef( pFileName, pBaseline, pSHA );
+        }
+    }
+
+    return pFileRef;
+}
+
+/*============================================================================*/
 /*  AddFile                                                                   */
 /*!
     Add a file to the manifest
@@ -1635,7 +1728,7 @@ static int AddFile( Manifest *pManifest, char *name )
          ( name != NULL ) )
     {
         /* Create a new file reference */
-        pFileRef = NewFileRef( name, NULL, NULL );
+        pFileRef = UpdateFileRef( pManifest, name, NULL, NULL );
         if ( pFileRef != NULL )
         {
             /* perform digest */
@@ -1650,6 +1743,11 @@ static int AddFile( Manifest *pManifest, char *name )
                 {
                     /* add the file reference to the manifest */
                     result = AddToManifest( pManifest, pFileRef );
+                    if ( result == EOK )
+                    {
+                        /* increment the manifest count */
+                        pManifest->nFiles++;
+                    }
                 }
                 else
                 {
@@ -1721,9 +1819,6 @@ static int AddToManifest( Manifest *pManifest, FileRef *pFileRef )
             pFileRef->pNext = pManifest->pFileRef;
             pManifest->pFileRef = pFileRef;
 
-            /* increment the manifest count */
-            pManifest->nFiles++;
-
             /* set the flag to indicate that the file reference has
                been added to the manifest list */
             pFileRef->inList = true;
@@ -1755,8 +1850,8 @@ static int AddToManifest( Manifest *pManifest, FileRef *pFileRef )
     FileRef baseline member.
 
     @param[in]
-        pManifest
-            pointer to the Manifest to add the file to
+        pFileRef
+            pointer to the FileRef object to add the baseline SHA to
 
     @param[in]
         pSHA
@@ -2365,10 +2460,6 @@ static int HandlePrintRequest( ManifestState *pState,
 
     @param[in]
         pManifest
-            pointer to the Manifest
-
-    @param[in]
-        pManifest
             pointer to the manifest to check the print request against
 
     @param[in]
@@ -2703,6 +2794,7 @@ static int HandleCreateEvent( Manifest *pManifest,
     char filename[PATH_MAX];
     int result = EINVAL;
     DirRef *pDirRef;
+    FileRef *pFileRef;
     int rc;
 
     if ( ( pManifest != NULL ) &&
@@ -2724,6 +2816,18 @@ static int HandleCreateEvent( Manifest *pManifest,
                 {
                     /* add a new file to be monitored within the manifest */
                     result = AddFile( pManifest, filename );
+                    if ( result == EOK )
+                    {
+                        /* get the FileRef from the hash table */
+                        pFileRef = HashFind( pManifest, filename );
+                        if ( pFileRef != NULL )
+                        {
+                            /* handle file change manifest updates */
+                            result = HandleFileChange( pManifest,
+                                                    pFileRef,
+                                                    hVarServer );
+                        }
+                    }
                 }
             }
             else
@@ -2802,6 +2906,18 @@ static int HandleDeleteEvent( Manifest *pManifest,
                     {
                         /* mark the file as deleted */
                         strcpy(pFileRef->sha, "DELETED" );
+
+                        /* decrement the file count */
+                        pManifest->nFiles--;
+
+                        /* remove the inotify watch */
+                        if ( ( pManifest->notifyfd > 0 ) &&
+                             ( pFileRef->id > 0 ) )
+                        {
+                            inotify_rm_watch( pManifest->notifyfd,
+                                              pFileRef->id );
+                            pFileRef->id = 0;
+                        }
 
                         /* handle file change manifest updates */
                         result = HandleFileChange( pManifest,
@@ -2928,8 +3044,8 @@ static int HandleFileChange( Manifest *pManifest,
     by 1 and updates the change counter variable if it is available.
 
     @param[in]
-        pState
-            pointer to the Manifest State
+        hVarServer
+            handle to the variable server
 
     @param[in]
         pManifest
@@ -3097,7 +3213,7 @@ static int AddLogEntry( Manifest *pManifest, int id, time_t timestamp )
 }
 
 /*============================================================================*/
-/*  AppendChangeLogFile                                                               */
+/*  AppendChangeLogFile                                                       */
 /*!
     Append an entry to the change log file
 
@@ -3482,7 +3598,7 @@ static int LoadBaseline( Manifest *pManifest )
                         pSHA = pValue->var.val.str;
 
                         /* process a baseline entry and
-                           add it to the manfiest */
+                           add it to the manifest */
                         rc = ProcessBaselineEntry( pManifest, pName, pSHA );
                         if ( rc == EOK )
                         {
