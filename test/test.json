@@ -4,6 +4,7 @@
         "rendervar" : "/sys/manifest/info",
         "countvar" : "/sys/manifest/changecount",
         "diffvar" : "/sys/manifest/diff",
+        "statsvar" : "/sys/manifest/stats",
         "diffcountvar" : "/sys/manifest/diffcount",
         "changelog" : "/sys/manifest/changelog",
         "changelogsize" : 10,
@@ -19,11 +20,18 @@
         "manifest" : "manifest2",
         "rendervar" : "/sys/manifest2/info",
         "countvar" : "/sys/manifest2/changecount",
+        "statsvar" : "/sys/manifest2/stats",
+        "baselinefile" : "/tmp/manifest2_baseline.json",
         "changelog" : "/sys/manifest2/changelog",
         "changelogsize" : 100,
+        "mapsize" : 5000,
         "sources" : [
             "/etc/passwd",
-            "/usr/local/include/varserver/varserver.h"
+            "/usr/local/include/varserver/varserver.h",
+            "/usr/local/bin",
+            "/usr/bin",
+            "/usr/local/include",
+            "/usr/bin"
         ]
     }
 ]

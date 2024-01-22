@@ -58,7 +58,7 @@ SOFTWARE.
 /*==============================================================================
         Includes
 ==============================================================================*/
-
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdbool.h>
 #include <string.h>
@@ -67,6 +67,8 @@ SOFTWARE.
 #include <unistd.h>
 #include <ctype.h>
 #include <fcntl.h>
+#include <inttypes.h>
+#include <search.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/mman.h>
@@ -87,19 +89,29 @@ SOFTWARE.
         Private definitions
 ==============================================================================*/
 
+#ifndef MANIFEST_SHA_LEN
+#define MANIFEST_SHA_LEN  ( 65 )
+#endif
+
 typedef struct _fileRef
 {
     /*! file name specifier */
     char *name;
 
     /*! calculated SHA256 */
-    char sha[65];
+    char sha[MANIFEST_SHA_LEN];
 
     /*! baseline SHA256 loaded from baseline file */
-    char baseline[65];
+    char baseline[MANIFEST_SHA_LEN];
 
     /*! file watch id */
     int id;
+
+    /*! flag to indicate if the FileRef object is part of a manifest list */
+    bool inList;
+
+    /*! flag to indicate if the FileRef object is part of the manifest hash */
+    bool inHash;
 
     /*! pointer to the next FileRef object */
     struct _fileRef *pNext;
@@ -157,11 +169,32 @@ typedef struct _manifest
     /*! handle to the baseline difference variable */
     VAR_HANDLE hBaselineDiff;
 
+    /*! name of the stats variable */
+    char *statsVarName;
+
+    /*! handle to the manifest stats variable */
+    VAR_HANDLE hStats;
+
+    /*! start time */
+    time_t t0;
+
+    /*! end time */
+    time_t t1;
+
     /*! list of FileRef objects which make up the manifest */
     FileRef *pFileRef;
 
+    /*! number of files being monitored */
+    size_t nFiles;
+
     /*! count the number of times a monitored file has changed */
     size_t changeCount;
+
+    /*! number of files in the baseline */
+    size_t baselineCount;
+
+    /*! count the number of files which differ from the baseline */
+    size_t baselineDiffCount;
 
     /*! maximum number of change log entries */
     size_t maxEntries;
@@ -189,6 +222,12 @@ typedef struct _manifest
 
     /*! dynamic file output */
     bool dynamicfile;
+
+    /*! size of the manifest hash map */
+    size_t mapsize;
+
+    /*! hash table */
+    struct hsearch_data *htab;
 
     /*! pointer to the next manifest in the list */
     struct _manifest *pNext;
@@ -245,6 +284,11 @@ typedef struct _varDef
 #define MANIFEST_TIME_FORMAT_STRING "%A %b %d %H:%M:%S %Y (GMT)"
 #endif
 
+#ifndef MANIFEST_MAP_SIZE_DEFAULT
+/*! default manifest map size */
+#define MANIFEST_MAP_SIZE_DEFAULT  ( 500 )
+#endif
+
 /*==============================================================================
         Private file scoped variables
 ==============================================================================*/
@@ -276,15 +320,24 @@ static int ProcessManifestArray( ManifestState *pState,
 static int ProcessManifestConfig( ManifestState *pState, JNode *config );
 static Manifest *CreateManifest( JNode *pConfig );
 
+static FileRef *NewFileRef( char *pFileName, char *pBaseline, char *pSHA );
+static int AddToManifest( Manifest *pManifest, FileRef *pFileRef );
+
 static int AddSource( Manifest *pManifest, char *name );
 static int AddDir( Manifest *pManifest, char *name );
 static int AddFile( Manifest *pManifest, char *name );
+
+static int ProcessBaselineEntry( Manifest *pManifest, char *pName, char *pSHA );
+
+static int AddBaselineSHA( FileRef *pFileRef, char *pSHA );
 
 static int CalcManifest( FileRef *pFileRef );
 
 static int MakeFileName( char *dirname, char *filename, char *out, size_t len );
 
 static int DumpManifest( Manifest *pManifest, int fd );
+
+static int DumpStats( Manifest *pManifest, int fd );
 
 static int SetupVars( VARSERVER_HANDLE hVarServer, Manifest *pManifest );
 
@@ -332,6 +385,12 @@ static int CompareBaseline( Manifest *pManifest, VARSERVER_HANDLE hVarServer );
 static int WriteBaselineDiff( Manifest *pManifest, int fd );
 
 static void Output( int fd, char *buf, size_t len );
+
+static int HashCreate( Manifest *pManifest );
+
+static int HashAdd( Manifest *pManifest, FileRef *pFileRef );
+
+static FileRef *HashFind( Manifest *pManifest, char *pFileName );
 
 /*==============================================================================
         Private function definitions
@@ -837,6 +896,9 @@ static int ProcessManifestConfig( ManifestState *pState, JNode *config )
                 result = rc;
             }
 
+            /* get the manifest t1 (initialization end) time */
+            pManifest->t1 = time(NULL);
+
             if ( result == EOK )
             {
                 /* increment the number of manifests we are handling */
@@ -910,6 +972,12 @@ static Manifest *CreateManifest( JNode *pConfig )
         pManifest = calloc( 1, sizeof( Manifest ) );
         if ( pManifest != NULL )
         {
+            /* set the default map size */
+            pManifest->mapsize = MANIFEST_MAP_SIZE_DEFAULT;
+
+            /* set the t0 time for the manifest */
+            pManifest->t0 = time(NULL);
+
             /* get the manifest name */
             name = JSON_GetStr( pConfig, "manifest" );
             pManifest->name = name;
@@ -931,6 +999,9 @@ static Manifest *CreateManifest( JNode *pConfig )
 
             /* get the name of the baseline difference variable */
             pManifest->diffVarName = JSON_GetStr( pConfig, "diffvar" );
+
+            /* get the name of the stats variable */
+            pManifest->statsVarName = JSON_GetStr( pConfig, "statsvar");
 
             /* get the name of the name of the change log variable */
             pManifest->changeLogName = JSON_GetStr( pConfig, "changelog" );
@@ -960,6 +1031,18 @@ static Manifest *CreateManifest( JNode *pConfig )
                 {
                     pManifest->maxEntries = n;
                 }
+            }
+
+            /* get the map size */
+            JSON_GetNum( pConfig, "mapsize", &n );
+            if ( n > 0 )
+            {
+                pManifest->mapsize = n;
+            }
+
+            if ( HashCreate( pManifest ) != EOK )
+            {
+                fprintf( stderr, "Failed to create manifest\n" );
             }
 
             /* get the sources list */
@@ -1312,6 +1395,95 @@ static int AddDir( Manifest *pManifest, char *name )
 }
 
 /*============================================================================*/
+/*  NewFileRef                                                                */
+/*!
+    Create a new FileRef object
+
+    The NewFileRef function creates a new file reference object and
+    optionally populates the baseline SHA and the current SHA.
+
+    @param[in]
+        pFileName
+            pointer to the file name of the new File Reference object
+
+    @param[in]
+        pBaseline
+            (optional) pointer to the baseline SHA
+
+    @param[in]
+        pSHA
+            (optional) pointer to the current SHA
+
+    @retval pointer to the new file reference
+    @retval NULL if the file reference object could not be created
+
+==============================================================================*/
+static FileRef *NewFileRef( char *pFileName, char *pBaseline, char *pSHA )
+{
+    FileRef *pFileRef = NULL;
+    size_t len;
+    int errcount = 0;
+
+    if ( pFileName != NULL )
+    {
+        pFileRef = calloc( 1, sizeof( FileRef ) );
+        if ( pFileRef != NULL )
+        {
+            pFileRef->name = strdup( pFileName );
+            if ( pFileRef->name != NULL )
+            {
+                if ( pBaseline != NULL )
+                {
+                    len = strlen( pBaseline );
+                    if ( len < MANIFEST_SHA_LEN )
+                    {
+                        strcpy( pFileRef->baseline, pBaseline );
+                    }
+                    else
+                    {
+                        errcount++;
+                    }
+                }
+
+                if ( pSHA != NULL )
+                {
+                    len = strlen( pSHA );
+                    if ( len < MANIFEST_SHA_LEN )
+                    {
+                        strcpy( pFileRef->sha, pSHA );
+                    }
+                    else
+                    {
+                        errcount++;
+                    }
+                }
+            }
+            else
+            {
+                errcount++;
+            }
+        }
+
+        if ( errcount > 0 )
+        {
+            if ( pFileRef != NULL )
+            {
+                if ( pFileRef->name != NULL )
+                {
+                    free( pFileRef->name );
+                    pFileRef->name = NULL;
+                }
+
+                free( pFileRef );
+                pFileRef = NULL;
+            }
+        }
+    }
+
+    return pFileRef;
+}
+
+/*============================================================================*/
 /*  AddFile                                                                   */
 /*!
     Add a file to the manifest
@@ -1342,13 +1514,10 @@ static int AddFile( Manifest *pManifest, char *name )
     if ( ( pManifest != NULL ) &&
          ( name != NULL ) )
     {
-        /* allocate memory for the manifest file reference */
-        pFileRef = calloc( 1, sizeof( FileRef ) );
+        /* Create a new file reference */
+        pFileRef = NewFileRef( name, NULL, NULL );
         if ( pFileRef != NULL )
         {
-            /* assign the file reference name */
-            pFileRef->name = strdup( name );
-
             /* perform digest */
             result = CalcManifest( pFileRef );
             if ( result == EOK )
@@ -1359,10 +1528,8 @@ static int AddFile( Manifest *pManifest, char *name )
                                                   IN_CLOSE_WRITE );
                 if ( pFileRef->id != -1 )
                 {
-                    /* add the manifest entry file reference to the
-                       manifest list */
-                    pFileRef->pNext = pManifest->pFileRef;
-                    pManifest->pFileRef = pFileRef;
+                    /* add the file reference to the manifest */
+                    result = AddToManifest( pManifest, pFileRef );
                 }
                 else
                 {
@@ -1391,6 +1558,112 @@ static int AddFile( Manifest *pManifest, char *name )
         {
             /* failed to allocate memory for the file reference */
             result = ENOMEM;
+        }
+    }
+
+    return result;
+}
+
+/*============================================================================*/
+/*  AddToManifest                                                             */
+/*!
+    Add a file reference to the manifest
+
+    The AddToManifest function adds the specified FileRef object to the
+    manifest FileRef object list. If the FileRef has already been added
+    then no action is taken.
+
+    @param[in]
+        pManifest
+            pointer to the Manifest to add the file to
+
+    @param[in]
+        pFileRef
+            pointer to the File Reference object to add
+
+    @retval EINVAL invalid arguments
+    @retval EOK file reference was successfully added to the manifest
+
+==============================================================================*/
+static int AddToManifest( Manifest *pManifest, FileRef *pFileRef )
+{
+    int result = EINVAL;
+
+    if ( ( pManifest != NULL ) &&
+         ( pFileRef != NULL ) )
+    {
+        result = EOK;
+
+        if ( pFileRef->inList == false )
+        {
+            /* add the manifest entry file reference to the
+                manifest list */
+            pFileRef->pNext = pManifest->pFileRef;
+            pManifest->pFileRef = pFileRef;
+
+            /* increment the manifest count */
+            pManifest->nFiles++;
+
+            /* set the flag to indicate that the file reference has
+               been added to the manifest list */
+            pFileRef->inList = true;
+        }
+
+        if ( pFileRef->inHash == false )
+        {
+            if ( pManifest->htab != NULL )
+            {
+                /* add the FileRef object to the manifest hash table */
+                result = HashAdd( pManifest, pFileRef );
+                if ( result == EOK )
+                {
+                    pFileRef->inHash = true;
+                }
+            }
+        }
+    }
+
+    return result;
+}
+
+/*============================================================================*/
+/*  AddBaselineSHA                                                            */
+/*!
+    Adds a baseline SHA to a FileReference object
+
+    The AddBaselineSHA function adds the specified SHA to the specified
+    FileRef baseline member.
+
+    @param[in]
+        pManifest
+            pointer to the Manifest to add the file to
+
+    @param[in]
+        pSHA
+            pointer to the SHA digest to add
+
+    @retval EINVAL invalid arguments
+    @retval E2BIG the specified SHA is too big to add
+    @retval EOK baseline SHA digest was successfully set
+
+==============================================================================*/
+static int AddBaselineSHA( FileRef *pFileRef, char *pSHA )
+{
+    int result = EINVAL;
+    size_t len;
+
+    if ( ( pFileRef != NULL ) &&
+         ( pSHA != NULL ) )
+    {
+        len = strlen( pSHA );
+        if ( len < MANIFEST_SHA_LEN )
+        {
+            strcpy( pFileRef->baseline, pSHA );
+            result = EOK;
+        }
+        else
+        {
+            result = E2BIG;
         }
     }
 
@@ -1624,7 +1897,13 @@ static int SetupVars( VARSERVER_HANDLE hVarServer, Manifest *pManifest )
             { pManifest->diffVarName,
             VARFLAG_VOLATILE,
             NOTIFY_PRINT,
-            &(pManifest->hBaselineDiff ) }
+            &(pManifest->hBaselineDiff ) },
+
+            { pManifest->statsVarName,
+            VARFLAG_VOLATILE,
+            NOTIFY_PRINT,
+            &(pManifest->hStats ) }
+
         };
 
         n = sizeof( vars ) / sizeof( vars[0] );
@@ -2000,6 +2279,10 @@ static int PrintManifestInfo( VAR_HANDLE hVar, Manifest *pManifest, int fd )
         else if ( hVar == pManifest->hBaselineDiff )
         {
             WriteBaselineDiff( pManifest, fd );
+        }
+        else if ( hVar == pManifest->hStats )
+        {
+            DumpStats( pManifest, fd );
         }
     }
 
@@ -2615,6 +2898,71 @@ static int DumpChangeLog( Manifest *pManifest, int fd )
 }
 
 /*============================================================================*/
+/*  DumpStats                                                                 */
+/*!
+    Dump the manifest statistics to the output file descriptor
+
+    The DumpStats function writes the manifest statistics
+    to the output file descriptor as a JSON object.
+
+    @param[in]
+        pManifest
+            pointer to the Manifest containing the statistics
+
+    @param[in]
+        fd
+            output file descriptor
+
+    @retval EOK output generated ok
+    @retval EINVAL invalid arguments
+
+==============================================================================*/
+static int DumpStats( Manifest *pManifest, int fd )
+{
+    int result = EINVAL;
+    char timestr[128];
+    time_t duration;
+
+    /* write the opening brace */
+    Output( fd, "{", 1 );
+
+    if ( pManifest != NULL )
+    {
+        result = EOK;
+
+        dprintf( fd,
+                 "\"baselinecount\":%lu,",
+                 (unsigned long)pManifest->baselineCount );
+
+        dprintf( fd, "\"filecount\":%lu,", (unsigned long)pManifest->nFiles );
+
+        if ( pManifest->baseline != NULL )
+        {
+            dprintf( fd,
+                     "\"baselinediff\":%lu,",
+                     (unsigned long)pManifest->baselineDiffCount );
+        }
+
+        /* construct the time string */
+        strftime( timestr,
+                sizeof( timestr ),
+                MANIFEST_TIME_FORMAT_STRING,
+                gmtime( &pManifest->t0 ) );
+
+        dprintf( fd, "\"init\":\"%s\",", timestr );
+
+        duration = pManifest->t1 - pManifest->t0;
+        dprintf (fd, "\"duration\" : %ld", duration );
+
+    }
+
+    /* write the closing brace */
+    Output( fd, "}", 1 );
+
+    return result;
+}
+
+/*============================================================================*/
 /*  WriteManifestFile                                                         */
 /*!
     Write the manifest to an output file
@@ -2717,61 +3065,145 @@ static int WriteManifestFile( Manifest *pManifest,
 static int LoadBaseline( Manifest *pManifest )
 {
     int result = EINVAL;
+    int rc;
     JNode *pBaseline;
-    FileRef *pFileRef;
-    char *pSha;
-    size_t len;
+    JNode *pNode = NULL;
+    JVar *pValue;
+    char *pName;
+    char *pSHA;
+    JObject *pObject;
 
     if ( pManifest != NULL )
     {
+        result = EOK;
+
+        /* initialize the baseline count */
+        pManifest->baselineCount = 0;
+
         if ( pManifest->baseline != NULL )
         {
             /* load the baseline file */
             pBaseline = JSON_Process( pManifest->baseline );
-            if ( pBaseline != NULL )
+            if ( ( pBaseline != NULL ) &&
+                 ( pBaseline->type == JSON_OBJECT ) )
             {
-                result = EOK;
-
-                pFileRef = pManifest->pFileRef;
-                while ( pFileRef != NULL )
-                {
-                    /* get the file baseline SHA */
-                    pSha = JSON_GetStr( pBaseline, pFileRef->name );
-                    if ( pSha != NULL )
-                    {
-                        /* get the length of the baseline SHA */
-                        len = strlen( pSha );
-                        if ( len < sizeof( pFileRef->baseline ) )
-                        {
-                            /* update the baseline SHA in the FileRef */
-                            strcpy( pFileRef->baseline, pSha );
-                        }
-                        else
-                        {
-                            /* not enough room for the baseline SHA */
-                            result = E2BIG;
-                        }
-                    }
-                    else
-                    {
-                        /* baseline SHA not found */
-                        memset( pFileRef->baseline,
-                                0,
-                                sizeof( pFileRef->baseline ) );
-
-                        result = ENOENT;
-                    }
-
-                    /* move to the next file reference */
-                    pFileRef = pFileRef->pNext;
-                }
+                pObject = (JObject *)pBaseline;
+                pNode = pObject->pFirst;
             }
 
-            JSON_Free( pBaseline );
+            while ( pNode != NULL )
+            {
+                if ( pNode->type == JSON_VAR )
+                {
+                    pValue = (JVar *)pNode;
+                    if ( pValue->var.type == JVARTYPE_STR )
+                    {
+                        pName = pValue->node.name;
+                        pSHA = pValue->var.val.str;
+
+                        /* process a baseline entry and
+                           add it to the manfiest */
+                        rc = ProcessBaselineEntry( pManifest, pName, pSHA );
+                        if ( rc == EOK )
+                        {
+                            /* increment the baseline file counter */
+                            pManifest->baselineCount++;
+                        }
+                    }
+                }
+
+                /* move to the next baseline entry to be processed */
+                pNode = pNode->pNext;
+            }
+
+            if ( pBaseline != NULL )
+            {
+                /* free the JSON baseline object */
+                JSON_Free( pBaseline );
+            }
         }
         else
         {
             result = ENOTSUP;
+        }
+    }
+
+    return result;
+}
+
+/*============================================================================*/
+/*  ProcessBaselineEntry                                                      */
+/*!
+    Process a single baseline entry
+
+    The ProcessBaselineEntry function proceses a single baseline entry
+    consisting of the name of the file, and the baseline SHA loaded from
+    the baseline file.
+
+    The baseline entry is added to the manifest hash map if it is not
+    there already, and added to the manifest file reference list if it
+    is not there already.
+
+    @param[in]
+        pManifest
+            pointer to the Manifest to load the baseline for
+
+    @param[in]
+        pName
+            pointer to the name of a baseline entry
+
+    @param[in]
+        pSHA
+            pointer to the baseline SHA for the specified file
+
+    @retval EOK baseline loaded ok
+    @retval ENOTSUP the baseline is not enabled
+    @retval E2BIG one or more baseline SHAs are too long
+    @retval ENOMEM memory allocation failure
+    @retval EINVAL invalid arguments
+
+==============================================================================*/
+static int ProcessBaselineEntry( Manifest *pManifest, char *pName, char *pSHA )
+{
+    int result = EINVAL;
+    int rc;
+    FileRef *pFileRef;
+
+    if ( ( pManifest != NULL ) &&
+         ( pName != NULL ) &&
+         ( pSHA != NULL ) )
+    {
+        /* assume everything is ok, until it is not */
+        result = EOK;
+
+        /* get the file reference from the
+            manifest hash table */
+        pFileRef = HashFind( pManifest, pName );
+        if ( pFileRef != NULL )
+        {
+            /* update File Reference with the baseline SHA */
+            rc = AddBaselineSHA( pFileRef, pSHA );
+            if ( rc != EOK )
+            {
+                fprintf( stderr,
+                         "Failed to add baseline SHA to %s\n",
+                         pName );
+
+                result = rc;
+            }
+        }
+        else
+        {
+            /* create a new File Reference object and set its name
+               and baseline SHA value */
+            pFileRef = NewFileRef( pName, pSHA, NULL );
+        }
+
+        if ( result == EOK )
+        {
+            /* add the file reference to the manifest if it
+                is not present already */
+            result = AddToManifest( pManifest, pFileRef );
         }
     }
 
@@ -2813,11 +3245,13 @@ static int CompareBaseline( Manifest *pManifest, VARSERVER_HANDLE hVarServer )
     FileRef *pFileRef;
     size_t len;
     VarObject obj;
+    int rc;
 
     if ( pManifest != NULL )
     {
-        if ( ( pManifest->baseline != NULL ) &&
-             ( pManifest->hBaselineMismatchCount != VAR_INVALID ) )
+        result = EOK;
+
+        if ( pManifest->baseline != NULL )
         {
             /* get a pointer to the first file in the manifest */
             pFileRef = pManifest->pFileRef;
@@ -2827,6 +3261,7 @@ static int CompareBaseline( Manifest *pManifest, VARSERVER_HANDLE hVarServer )
                 if ( strcmp( pFileRef->sha, pFileRef->baseline ) != 0 )
                 {
                     /* increment the mismatch counter */
+                    printf("%s : %8s : %8s\n", pFileRef->name, pFileRef->sha, pFileRef->baseline );
                     count++;
                 }
 
@@ -2835,11 +3270,20 @@ static int CompareBaseline( Manifest *pManifest, VARSERVER_HANDLE hVarServer )
             }
 
             /* update the baseline compare variable */
-            obj.type = VARTYPE_UINT32;
-            obj.val.ul = count;
-            result = VAR_Set( hVarServer,
-                            pManifest->hBaselineMismatchCount,
-                            &obj );
+            pManifest->baselineDiffCount = count;
+
+            if ( pManifest->hBaselineMismatchCount != VAR_INVALID )
+            {
+                obj.type = VARTYPE_UINT32;
+                obj.val.ul = count;
+                rc = VAR_Set( hVarServer,
+                              pManifest->hBaselineMismatchCount,
+                              &obj );
+                if ( rc != EOK )
+                {
+                    result = rc;
+                }
+            }
         }
         else
         {
@@ -2955,6 +3399,156 @@ static void Output( int fd, char *buf, size_t len )
             fprintf( stderr, "write failed\n" );
         }
     }
+}
+
+/*============================================================================*/
+/*  HashCreate                                                                */
+/*!
+    Create a new hash table for the manifest
+
+    The HashCreate function creates a new hash table for the specified
+    manifest. The size of the hash table should be predefined in
+    pManifest->mapsize
+
+    @param[in]
+        pManifest
+            pointer to the manifest to create the hash table for
+
+    @retval EOK has table created ok
+    @retval ENOMEM memory allocation failure
+    @retval EINVAL invalid arguments
+
+==============================================================================*/
+static int HashCreate( Manifest *pManifest )
+{
+    int result = EINVAL;
+    int rc;
+
+    if ( pManifest != NULL )
+    {
+        /* allocate memory for the manifest hsearch_data */
+        pManifest->htab = calloc( 1, sizeof( struct hsearch_data ) );
+        if ( pManifest->htab != NULL )
+        {
+            rc = hcreate_r( pManifest->mapsize, pManifest->htab );
+            if ( rc == 0 )
+            {
+                result = errno;
+            }
+            else
+            {
+                result = EOK;
+            }
+        }
+    }
+
+    return result;
+}
+
+/*============================================================================*/
+/*  HashAdd                                                                   */
+/*!
+    Add a new FileRef to the manifest hash table
+
+    The HashAdd function adds a new FileRef to the manifest hash
+    table.
+
+    @param[in]
+        pManifest
+            pointer to the manifest to add to
+
+    @param[in]
+        pFileRef
+            pointer to the FileRef object to add
+
+    @retval EOK the FileRef object was successfully added to the manifest hash
+    @retval ENOMEM memory allocation failure
+    @retval EINVAL invalid arguments
+    @retval ENOTSUP no hash table exists in the specified manifest
+
+==============================================================================*/
+static int HashAdd( Manifest *pManifest, FileRef *pFileRef )
+{
+    int result = EINVAL;
+    ENTRY e;
+    ENTRY *ep = NULL;
+
+    if ( ( pManifest != NULL ) &&
+         ( pFileRef != NULL ) &&
+         ( pFileRef->name != NULL ) )
+    {
+        if ( pManifest->htab != NULL )
+        {
+            e.key = pFileRef->name;
+            e.data = pFileRef;
+
+            /* enter the value into the hash table */
+            if ( ( hsearch_r( e, ENTER, &ep, pManifest->htab ) != 0 ) &&
+                 ( ep != NULL ) )
+            {
+                result = EOK;
+            }
+            else
+            {
+                result = errno;
+            }
+        }
+        else
+        {
+            result = ENOTSUP;
+        }
+    }
+
+    return result;
+}
+
+/*============================================================================*/
+/*  HashFind                                                                  */
+/*!
+    Search for a File Reference in the manifest hash table
+
+    The HashFind function searches for a file reference in the specified
+    manifest's hash table.
+
+    @param[in]
+        pManifest
+            pointer to the manifest to search
+
+    @param[in]
+        pFileName
+            pointer to name of a file to search for
+
+    @retval pointer to the found FileRef object
+    @retval NULL the FileRef was not found
+
+==============================================================================*/
+static FileRef *HashFind( Manifest *pManifest, char *pFileName )
+{
+    int result = EINVAL;
+    ENTRY *ep = NULL;
+    ENTRY e;
+    FileRef *pFileRef = NULL;
+
+    if ( ( pManifest != NULL ) &&
+         ( pFileName != NULL ) )
+    {
+        if ( pManifest->htab != NULL )
+        {
+            e.key = pFileName;
+            e.data = NULL;
+            if ( hsearch_r( e, FIND, &ep, pManifest->htab ) != 0 )
+            {
+                result = EOK;
+            }
+        }
+
+        if ( ( ep != NULL ) && ( result == EOK ) )
+        {
+            pFileRef = (FileRef *)(ep->data);
+        }
+    }
+
+    return pFileRef;
 }
 
 /*! @}
