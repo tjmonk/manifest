@@ -3072,6 +3072,7 @@ static int LoadBaseline( Manifest *pManifest )
     char *pName;
     char *pSHA;
     JObject *pObject;
+    static int idx = 0;
 
     if ( pManifest != NULL )
     {
@@ -3261,7 +3262,6 @@ static int CompareBaseline( Manifest *pManifest, VARSERVER_HANDLE hVarServer )
                 if ( strcmp( pFileRef->sha, pFileRef->baseline ) != 0 )
                 {
                     /* increment the mismatch counter */
-                    printf("%s : %8s : %8s\n", pFileRef->name, pFileRef->sha, pFileRef->baseline );
                     count++;
                 }
 
@@ -3434,6 +3434,11 @@ static int HashCreate( Manifest *pManifest )
             if ( rc == 0 )
             {
                 result = errno;
+                fprintf( stderr,
+                         "HashCreate Error: %s : %s\n",
+                         pManifest->name,
+                         strerror( result ) );
+
             }
             else
             {
@@ -3491,6 +3496,11 @@ static int HashAdd( Manifest *pManifest, FileRef *pFileRef )
             else
             {
                 result = errno;
+                fprintf( stderr,
+                         "HashAdd Error: %s : %s\n",
+                         pFileRef->name,
+                         strerror( result ) );
+
             }
         }
         else

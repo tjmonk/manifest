@@ -21,8 +21,11 @@
         "rendervar" : "/sys/manifest2/info",
         "countvar" : "/sys/manifest2/changecount",
         "statsvar" : "/sys/manifest2/stats",
+        "diffvar" : "/sys/manifest2/diff",
+        "diffcountvar": "/sys/manifest2/diffcount",
         "baselinefile" : "/tmp/manifest2_baseline.json",
         "changelog" : "/sys/manifest2/changelog",
+        "manifestfile" : "/tmp/manifest2.json",
         "changelogsize" : 100,
         "mapsize" : 5000,
         "sources" : [
@@ -30,8 +33,7 @@
             "/usr/local/include/varserver/varserver.h",
             "/usr/local/bin",
             "/usr/bin",
-            "/usr/local/include",
-            "/usr/bin"
+            "/usr/local/include"
         ]
     }
 ]
