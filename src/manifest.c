@@ -509,7 +509,10 @@ int main(int argc, char **argv)
         }
 
         /* close the handle to the variable server */
-        VARSERVER_Close( hVarServer );
+       if ( VARSERVER_Close( state.hVarServer ) == EOK )
+       {
+            state.hVarServer = NULL;
+       }
     }
 
     return ( result == EOK ) ? 0 : 1;
@@ -2051,7 +2054,10 @@ static void TerminationHandler( int signum, siginfo_t *info, void *ptr )
 
     if ( state.hVarServer != NULL )
     {
-        VARSERVER_Close( state.hVarServer );
+        if ( VARSERVER_Close( state.hVarServer ) == EOK )
+        {
+            state.hVarServer = NULL;
+        }
     }
 
     exit( 1 );
